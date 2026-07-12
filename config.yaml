@@ -1,0 +1,23 @@
+seed: 42
+
+data:
+  season_dir: "/kaggle/working/ROIs1868_summer"  # adjust to wherever you download the season on Kaggle
+  val_frac: 0.2                                    # fraction of ROI *scenes* (not patches) held out for val
+
+model:
+  in_ch: 1
+  out_ch: 3
+  base_channels: 64      # standard pix2pix capacity; comfortably fits a single T4's 16GB VRAM at this batch size
+
+train:
+  batch_size: 16          # fits on one T4 at 256x256 with base_channels=64; raise to 24-32 if you confirm headroom
+  epochs: 60               # see note below on sizing this against your real per-epoch time and the 12hr session cap
+  lr: 0.0002
+  beta1: 0.5
+  beta2: 0.999
+  lambda_l1: 100.0
+  lambda_perceptual: 0.0   # ablation run #1 (L1 + adversarial only). Set to 10.0 for ablation run #2.
+  use_lsgan: true
+  num_workers: 2           # Kaggle notebooks typically expose 2-4 CPU cores; 2 is a safe default, raise if no bottleneck
+  checkpoint_dir: "/kaggle/working/outputs/checkpoints"
+  log_dir: "/kaggle/working/outputs"
