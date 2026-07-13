@@ -81,8 +81,8 @@ def get_loaders(cfg, train_ds, val_ds):
     return train_loader, val_loader
     
 def initModels(cfg, device):
-    G = UNetGenerator(cfg["model"]["in_ch"], cfg["model"]["out_ch"], cfg["model"]["base_ch"]).to(device)
-    D = PatchGANDiscriminator(cfg["model"]["in_ch"], cfg["model"]["out_ch"], cfg["model"]["base_ch"]).to(device)
+    G = UNetGenerator(cfg["model"]["in_ch"], cfg["model"]["out_ch"], cfg["model"]["base_channels"]).to(device)
+    D = PatchGANDiscriminator(cfg["model"]["in_ch"], cfg["model"]["out_ch"], cfg["model"]["base_channels"]).to(device)
     
     return G, D
 
