@@ -9,10 +9,12 @@ import argparse
 import csv
 import os
 import random
+import time
  
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.amp import autocast, GradScaler
 import yaml
 from torch.utils.data import DataLoader
  
@@ -90,7 +92,7 @@ def initOptimizers(cfg, G, D):
     opt_D = torch.optim.Adam(D.parameters(), cfg["train"]["lr"], betas=(cfg["train"]["beta1"], cfg["train"]["beta2"]))
     return opt_G, opt_D
     
-def continue_training_from_last_ckpt(full_ckpt_path, G, D, opt_G, opt_D, device):
+def continue_training_from_last_ckpt(full_ckpt_path, G, D, opt_G, opt_D, scaler_G, scaler_D, device):
     if not os.path.exists(full_ckpt_path):
         raise FileNotFoundError(f"no training checkpoint found at {full_ckpt_path}")
     
@@ -99,6 +101,9 @@ def continue_training_from_last_ckpt(full_ckpt_path, G, D, opt_G, opt_D, device)
     D.load_state_dict(ckpt["D_state"])
     opt_G.load_state_dict(ckpt["opt_G_state"])
     opt_D.load_state_dict(ckpt["opt_D_state"])
+    if "scaler_G_state" in ckpt:
+        scaler_G.load_state_dict(ckpt["scaler_G_state"])
+        scaler_D.load_state_dict(ckpt["scaler_D_state"])
     history = ckpt["history"]
     start_epoch = ckpt["epoch"] + 1
     print(f"resumed from epoch {ckpt['epoch']}, continuing at epoch {start_epoch}")
@@ -124,6 +129,12 @@ def main(cfg_path, resume):
     roi_ids = list_roi_ids(cfg["data"]["seasons_dir"])
     train_ids, val_ids = split_roi_ids(roi_ids, val_frac=cfg["data"]["val_frac"], seed=cfg["seed"])
     
+    max_train_rois = cfg["data"].get("max_train_rois")
+    if max_train_rois is not None:
+        train_ids = train_ids[:max_train_rois]
+    
+    print(f"{len(roi_ids)} ROI scenes total -> {len(train_ids)} train / {len(val_ids)} val")
+    
     train_ds = SAR2EODataset(cfg["data"]["seasons_dir"], train_ids)
     val_ds = SAR2EODataset(cfg["data"]["seasons_dir"], val_ids)
     print(f"train pairs: {len(train_ds)}, val pairs: {len(val_ds)}")
@@ -136,6 +147,10 @@ def main(cfg_path, resume):
     l1_loss = nn.L1Loss()
     gan_loss = nn.MSELoss() if cfg["train"]["use_lsgan"] else nn.BCEWithLogitsLoss()
     
+    use_amp = (device.type == "cuda")
+    scaler_G = GradScaler(device.type, enabled = use_amp)
+    scaler_D = GradScaler(device.type, enabled = use_amp)
+    
     lambda_l1 = cfg["train"]["lambda_l1"]
     lambda_perc = cfg["train"]["lambda_perceptual"]
     perceptual_loss_fn = get_perceptual_loss_fn(device) if lambda_perc > 0 else None
@@ -144,7 +159,7 @@ def main(cfg_path, resume):
     history = []  # per-epoch: epoch, g_loss, d_loss, val_l1
     
     if resume:
-        continue_training_from_last_ckpt(full_ckpt_path, G, D, opt_G, opt_D, device)
+        continue_training_from_last_ckpt(full_ckpt_path, G, D, opt_G, opt_D, scaler_G, scaler_D, device)
     
     total_epochs = cfg["train"]["epochs"]
     if(start_epoch > total_epochs):
@@ -152,35 +167,43 @@ def main(cfg_path, resume):
         return
 
     for epoch in range(start_epoch, total_epochs + 1):
+        epoch_start = time.perf_counter()
+        
         G.train()
         D.train()
         g_losses, d_losses = [], []
  
         for sar, eo in train_loader:
             sar, eo = sar.to(device), eo.to(device)
-            valid = torch.ones_like(D(sar, eo))
-            fake_label = torch.zeros_like(valid)
+            with autocast(device_type = device.type, enabled = use_amp):
+                fake_eo = G(sar)
  
             # --- train discriminator ---
             opt_D.zero_grad()
-            fake_eo = G(sar).detach()
-            pred_real = D(sar, eo)
-            pred_fake = D(sar, fake_eo)
-            d_loss = 0.5 * (gan_loss(pred_real, valid) + gan_loss(pred_fake, fake_label))
-            d_loss.backward()
-            opt_D.step()
+            with autocast(device_type = device.type, enabled = use_amp):
+                pred_real = D(sar, eo)
+                pred_fake_for_d = D(sar, fake_eo.detach())
+                valid = torch.ones_like(pred_real)
+                fake_label = torch.zeros_like(pred_real)
+                d_loss = 0.5 * (gan_loss(pred_real, valid) + gan_loss(pred_fake_for_d, fake_label))
+
+            scaler_D.scale(d_loss).backward()
+            scaler_D.step(opt_D)
+            scaler_D.update()
  
             # --- train generator ---
             opt_G.zero_grad()
-            fake_eo = G(sar)
-            pred_fake = D(sar, fake_eo)
-            g_adv = gan_loss(pred_fake, valid)
-            g_l1 = l1_loss(fake_eo, eo) * lambda_l1
-            g_loss = g_adv + g_l1
-            if perceptual_loss_fn is not None:
-                g_loss = g_loss + perceptual_loss_fn(fake_eo, eo) * lambda_perc
-            g_loss.backward()
-            opt_G.step()
+            with autocast(device_type = device.type, enabled = use_amp):
+                pred_fake_for_g = D(sar, fake_eo)
+                g_adv = gan_loss(pred_fake_for_g, valid)
+                g_l1 = l1_loss(fake_eo, eo) * lambda_l1
+                g_loss = g_adv + g_l1
+                if perceptual_loss_fn is not None:
+                    g_loss = g_loss + perceptual_loss_fn(fake_eo, eo) * lambda_perc
+                    
+            scaler_G.scale(g_loss).backward()
+            scaler_G.step(opt_G)
+            scaler_G.update()
  
             g_losses.append(g_loss.item())
             d_losses.append(d_loss.item())
@@ -193,11 +216,13 @@ def main(cfg_path, resume):
                 sar, eo = sar.to(device), eo.to(device)
                 fake_eo = G(sar)
                 val_l1s.append(l1_loss(fake_eo, eo).item())
+            
+        elapsed_time = time.perf_counter() - epoch_start
  
         # cast to native floats -- numpy scalars aren't in torch.load's weights_only=True
         # allowlist (default since PyTorch 2.6) and would break --resume otherwise
         mean_g, mean_d, mean_val = float(np.mean(g_losses)), float(np.mean(d_losses)), float(np.mean(val_l1s))
-        print(f"epoch {epoch:03d}/{total_epochs} | G {mean_g:.4f} | D {mean_d:.4f} | val_L1 {mean_val:.4f}")
+        print(f"epoch {epoch:03d}/{total_epochs} | G {mean_g:.4f} | D {mean_d:.4f} | val_L1 {mean_val:.4f} (time : {elapsed_time:.2f}s)")
         history.append({"epoch": epoch, "g_loss": mean_g, "d_loss": mean_d, "val_l1": mean_val})
  
         # full state (for resuming) + plain generator weights (for eval.py / infer.py)

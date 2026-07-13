@@ -3,6 +3,7 @@ seed: 42
 data:
   seasons_dir: "/kaggle/input/datasets/ayaanrzaverigmailcom/data-pairs/ROIs1868_summer"  # adjust to wherever you download the season on Kaggle
   val_frac: 0.2                                    # fraction of ROI *scenes* (not patches) held out for val
+  max_train_rois: 25 
 
 model:
   in_ch: 1
