@@ -68,7 +68,7 @@ def save_checkpoint(path, epoch, G, D, opt_G, opt_D, scaler_G, scaler_D, history
         "D_state": D.state_dict(),
         "opt_G_state": opt_G.state_dict(),
         "opt_D_state": opt_D.state_dict(),
-          "scaler_G_state": scaler_G.state_dict(),
+        "scaler_G_state": scaler_G.state_dict(),
         "scaler_D_state": scaler_D.state_dict(),
         "history": history,
     }, path)
@@ -89,9 +89,14 @@ def initModels(cfg, device):
     D = PatchGANDiscriminator(cfg["model"]["in_ch"], cfg["model"]["out_ch"], cfg["model"]["base_channels"]).to(device)
     return G, D
 
+# def initOptimizers(cfg, G, D):
+#     opt_G = torch.optim.Adam(G.parameters(), lr = cfg["train"]["lr"], betas=(cfg["train"]["beta1"], cfg["train"]["beta2"]))
+#     opt_D = torch.optim.Adam(D.parameters(), lr = cfg["train"]["lr"], betas=(cfg["train"]["beta1"], cfg["train"]["beta2"]))
+#     return opt_G, opt_D
+
 def initOptimizers(cfg, G, D):
-    opt_G = torch.optim.Adam(G.parameters(), cfg["train"]["lr"], betas=(cfg["train"]["beta1"], cfg["train"]["beta2"]))
-    opt_D = torch.optim.Adam(D.parameters(), cfg["train"]["lr"], betas=(cfg["train"]["beta1"], cfg["train"]["beta2"]))
+    opt_G = torch.optim.Adam(G.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    opt_D = torch.optim.Adam(D.parameters(), lr=0.00005, betas=(0.5, 0.999)) # Slow D down by 4x
     return opt_G, opt_D
     
 def continue_training_from_last_ckpt(full_ckpt_path, G, D, opt_G, opt_D, scaler_G, scaler_D, device):
@@ -109,6 +114,7 @@ def continue_training_from_last_ckpt(full_ckpt_path, G, D, opt_G, opt_D, scaler_
     history = ckpt["history"]
     start_epoch = ckpt["epoch"] + 1
     print(f"resumed from epoch {ckpt['epoch']}, continuing at epoch {start_epoch}")
+    return start_epoch, history
 
 def train_one_epoch(train_loader : DataLoader, val_loader : DataLoader):
     pass
@@ -161,7 +167,7 @@ def main(cfg_path, resume):
     history = []  # per-epoch: epoch, g_loss, d_loss, val_l1
     
     if resume:
-        continue_training_from_last_ckpt(full_ckpt_path, G, D, opt_G, opt_D, scaler_G, scaler_D, device)
+        start_epoch, history = continue_training_from_last_ckpt(full_ckpt_path, G, D, opt_G, opt_D, scaler_G, scaler_D, device)
     
     total_epochs = cfg["train"]["epochs"]
     if(start_epoch > total_epochs):
@@ -187,6 +193,7 @@ def main(cfg_path, resume):
                 pred_fake_for_d = D(sar, fake_eo.detach())
                 valid = torch.ones_like(pred_real)
                 fake_label = torch.zeros_like(pred_real)
+                
                 d_loss = 0.5 * (gan_loss(pred_real, valid) + gan_loss(pred_fake_for_d, fake_label))
 
             scaler_D.scale(d_loss).backward()
@@ -223,7 +230,6 @@ def main(cfg_path, resume):
             
         elapsed_time = time.perf_counter() - epoch_start
  
-        
         mean_g = float(np.mean(g_losses))
         mean_d = float(np.mean(d_losses))
         mean_g_adv = float(np.mean(g_adv_losses))
@@ -232,7 +238,7 @@ def main(cfg_path, resume):
         
         print(
             f"epoch {epoch:03d}/{total_epochs} | G {mean_g:.4f} (adv {mean_g_adv:.4f} + l1 {mean_g_l1:.4f}) "
-            f"| D {mean_d:.4f} | val_L1 {mean_val:.4f}"
+            f"| D {mean_d:.4f} | val_L1 {mean_val:.4f} | time {elapsed_time:.1f}s"
         )
         
         history.append({
