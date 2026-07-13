@@ -83,12 +83,12 @@ def get_loaders(cfg, train_ds, val_ds):
 def initModels(cfg, device):
     G = UNetGenerator(cfg["model"]["in_ch"], cfg["model"]["out_ch"], cfg["model"]["base_channels"]).to(device)
     D = PatchGANDiscriminator(cfg["model"]["in_ch"], cfg["model"]["out_ch"], cfg["model"]["base_channels"]).to(device)
-    
     return G, D
 
 def initOptimizers(cfg, G, D):
     opt_G = torch.optim.Adam(G.parameters(), cfg["train"]["lr"], betas=(cfg["train"]["beta1"], cfg["train"]["beta2"]))
     opt_D = torch.optim.Adam(D.parameters(), cfg["train"]["lr"], betas=(cfg["train"]["beta1"], cfg["train"]["beta2"]))
+    return opt_G, opt_D
     
 def continue_training_from_last_ckpt(full_ckpt_path, G, D, opt_G, opt_D, device):
     if not os.path.exists(full_ckpt_path):
