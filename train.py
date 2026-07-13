@@ -61,13 +61,15 @@ def get_perceptual_loss_fn(device):
 
     return loss_fn
 
-def save_checkpoint(path, epoch, G, D, opt_G, opt_D, history):
+def save_checkpoint(path, epoch, G, D, opt_G, opt_D, scaler_G, scaler_D, history):
     torch.save({
         "epoch": epoch,
         "G_state": G.state_dict(),
         "D_state": D.state_dict(),
         "opt_G_state": opt_G.state_dict(),
         "opt_D_state": opt_D.state_dict(),
+          "scaler_G_state": scaler_G.state_dict(),
+        "scaler_D_state": scaler_D.state_dict(),
         "history": history,
     }, path)
 
@@ -171,7 +173,7 @@ def main(cfg_path, resume):
         
         G.train()
         D.train()
-        g_losses, d_losses = [], []
+        g_losses, d_losses, g_adv_losses, g_l1_losses = [], [], [], []
  
         for sar, eo in train_loader:
             sar, eo = sar.to(device), eo.to(device)
@@ -207,6 +209,8 @@ def main(cfg_path, resume):
  
             g_losses.append(g_loss.item())
             d_losses.append(d_loss.item())
+            g_adv_losses.append(g_adv.item())
+            g_l1_losses.append(g_l1.item())
  
         # --- validation (L1 only here; run eval.py separately for LPIPS/FID/SSIM/PSNR) ---
         G.eval()
@@ -219,14 +223,25 @@ def main(cfg_path, resume):
             
         elapsed_time = time.perf_counter() - epoch_start
  
-        # cast to native floats -- numpy scalars aren't in torch.load's weights_only=True
-        # allowlist (default since PyTorch 2.6) and would break --resume otherwise
-        mean_g, mean_d, mean_val = float(np.mean(g_losses)), float(np.mean(d_losses)), float(np.mean(val_l1s))
-        print(f"epoch {epoch:03d}/{total_epochs} | G {mean_g:.4f} | D {mean_d:.4f} | val_L1 {mean_val:.4f} (time : {elapsed_time:.2f}s)")
-        history.append({"epoch": epoch, "g_loss": mean_g, "d_loss": mean_d, "val_l1": mean_val})
- 
+        
+        mean_g = float(np.mean(g_losses))
+        mean_d = float(np.mean(d_losses))
+        mean_g_adv = float(np.mean(g_adv_losses))
+        mean_g_l1 = float(np.mean(g_l1_losses))
+        mean_val = float(np.mean(val_l1s))
+        
+        print(
+            f"epoch {epoch:03d}/{total_epochs} | G {mean_g:.4f} (adv {mean_g_adv:.4f} + l1 {mean_g_l1:.4f}) "
+            f"| D {mean_d:.4f} | val_L1 {mean_val:.4f}"
+        )
+        
+        history.append({
+            "epoch": epoch, "g_loss": mean_g, "g_adv": mean_g_adv, "g_l1": mean_g_l1,
+            "d_loss": mean_d, "val_l1": mean_val,
+        })
+        
         # full state (for resuming) + plain generator weights (for eval.py / infer.py)
-        save_checkpoint(full_ckpt_path, epoch, G, D, opt_G, opt_D, history)
+        save_checkpoint(full_ckpt_path, epoch, G, D, opt_G, opt_D, scaler_G, scaler_D, history)
         torch.save(G.state_dict(), os.path.join(ckpt_dir, "generator_latest.pt"))
  
     # --- persist raw loss values + plot, as required by the assignment ---

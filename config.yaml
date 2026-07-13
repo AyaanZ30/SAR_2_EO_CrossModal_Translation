@@ -12,7 +12,7 @@ model:
 
 train:
   batch_size: 16          # fits on one T4 at 256x256 with base_channels=64; raise to 24-32 if you confirm headroom
-  epochs: 60               # see note below on sizing this against your real per-epoch time and the 12hr session cap
+  epochs: 30               # see note below on sizing this against your real per-epoch time and the 12hr session cap
   lr: 0.0002
   beta1: 0.5
   beta2: 0.999
