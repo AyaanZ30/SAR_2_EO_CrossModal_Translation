@@ -20,6 +20,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from accelerate import Accelerator
 from diffusers import AutoencoderKL, DDPMScheduler
  
 from src.dataset import SAR2EODataset, list_roi_ids, split_roi_ids
@@ -93,13 +94,19 @@ def main(cfg_path, resume):
         cfg = yaml.safe_load(f)
     
     set_seed(cfg["seed"])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"using device: {device}")
+    
+    accelerator = Accelerator(mixed_precision = "fp16" if torch.cuda.is_available() else "no")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # print(f"using device: {device}")
+    device = accelerator.device
     
     ckpt_dir = cfg["train"]["checkpoint_dir"]
     log_dir = cfg["train"]["log_dir"]
-    os.makedirs(ckpt_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
+    
+    if accelerator.is_main_process:
+        os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
+        
     full_ckpt_path = os.path.join(ckpt_dir, "cdiffset_state.pt")
     
     roi_ids = list_roi_ids(cfg["data"]["seasons_dir"])
@@ -122,24 +129,29 @@ def main(cfg_path, resume):
         param.requires_grad = False
     
     noise_scheduler = DDPMScheduler(num_train_timesteps = 1000)
-    
     model = CDiffSETUNet(latent_channels = cfg["model"]["latent_channels"], base_channels = cfg["model"]["base_channels"]).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]), weight_decay=1e-4)
     
-    use_amp = (device.type == "cuda")
-    scaler = GradScaler(device.type, enabled=use_amp)
+    model, optimizer, train_loader, val_loader = accelerator.prepare(
+        model, optimizer, train_loader, val_loader
+    )
+    
+    # use_amp = (device.type == "cuda")
+    # scaler = GradScaler(device.type, enabled=use_amp)
     
     start_epoch = 1
     history = []  # per-epoch: epoch, g_loss, d_loss, val_l1
     
-    if resume:
-        start_epoch, history = load_checkpoint(full_ckpt_path, model, optimizer, scaler, device)
-    
-    total_epochs = cfg["train"]["epochs"]
-    if(start_epoch > total_epochs):
-        print(f"checkpoint is already at epoch {start_epoch - 1} >= configured epochs {total_epochs}. Nothing to do.")
-        return
+    if resume and os.path.exists(full_ckpt_path):
+        # start_epoch, history = load_checkpoint(full_ckpt_path, model, optimizer, scaler, device)
+        accelerator.wait_for_everyone()
+        ckpt = torch.load(full_ckpt_path, map_location=device)
+        accelerator.unwrap_model(model).load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        start_epoch = ckpt["epoch"] + 1
+        history = ckpt["history"]
 
+    total_epochs = cfg["train"]["epochs"]
     for epoch in range(start_epoch, total_epochs + 1):
         epoch_start = time.perf_counter()
         
@@ -167,19 +179,18 @@ def main(cfg_path, resume):
             u_net_input = torch.cat([z_x, z_y_noisy], dim = 1)
             
             optimizer.zero_grad()
-            with autocast(device_type = device.type, enabled = use_amp):
-                pred_noise, confidence = model(u_net_input, timesteps)
-                
-                # Dynamic Confidence Weighted Loss execution (C-Diff objective)
-                noise_residual = torch.square(noise - pred_noise)
-                
-                # L_C_Diff = (noise - pred noise)^2 * confidence_map - log(confidence_map + 1e-6) (to prvent log 0)
-                loss_map = noise_residual * confidence - torch.log(confidence + 1e-6)
-                loss = loss_map.mean()
+            # Forward pass implicitly maps mixed-precision configurations
+            pred_noise, confidence = model(u_net_input, timesteps) #
             
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            noise_residual = torch.square(noise - pred_noise)
+            loss_map = noise_residual * confidence - torch.log(confidence + 1e-6) #
+            loss = loss_map.mean()
+            
+            # scaler.scale(loss).backward()
+            # scaler.step(optimizer)
+            # scaler.update()
+            accelerator.backward(loss)
+            optimizer.step()
             
             train_losses.append(loss.item())
         
@@ -206,6 +217,9 @@ def main(cfg_path, resume):
                 
                 decoded_output = vae.decode(z_denoised / 0.18215).sample
                 
+                # Gather individual tensors back across process boundaries safely
+                gathered_sar, gathered_eo, gathered_pred = accelerator.gather_for_metrics((sar, eo, decoded_output))
+                
                 # directly compute l1 pixel loss [netween generated eo (decoded o/p) and eo]
                 batch_l1 = l1_metric(decoded_output, eo).mean(dim = [1, 2, 3])
             
@@ -217,39 +231,49 @@ def main(cfg_path, resume):
                         'gt': eo[idx].cpu()
                     })
             
-        all_val_records.sort(key = lambda item : item['loss'])
-        best_5_samples = all_val_records[:5]    
-        worst_5_samples = all_val_records[-5:]    
-        mean_val_l1 = np.mean([item['loss'] for item in all_val_records])
+        if accelerator.is_main_process():
+            all_val_records.sort(key = lambda item : item['loss'])
+            best_5_samples = all_val_records[:5]    
+            worst_5_samples = all_val_records[-5:]    
+            mean_val_l1 = np.mean([item['loss'] for item in all_val_records])
+                
+            elapsed_time = time.perf_counter() - epoch_start
+            mean_train_loss = np.mean(train_losses)
+            print(f"Epoch {epoch:03d}/{total_epochs} | Train Loss: {mean_train_loss:.4f} | Val L1 Error: {mean_val_l1:.4f} | Time: {elapsed_time:.1f}s")
             
-        elapsed_time = time.perf_counter() - epoch_start
-        mean_train_loss = np.mean(train_losses)
-        print(f"Epoch {epoch:03d}/{total_epochs} | Train Loss: {mean_train_loss:.4f} | Val L1 Error: {mean_val_l1:.4f} | Time: {elapsed_time:.1f}s")
+            history.append({"epoch": epoch, "train_loss": mean_train_loss, "val_l1": mean_val_l1})
+            # save_checkpoint(full_ckpt_path, epoch, model, optimizer, scaler, history)
+            torch.save({
+                "epoch": epoch,
+                "model_state": accelerator.unwrap_model(model).state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "history": history,
+            }, full_ckpt_path)
         
-        history.append({"epoch": epoch, "train_loss": mean_train_loss, "val_l1": mean_val_l1})
-        save_checkpoint(full_ckpt_path, epoch, model, optimizer, scaler, history)
-
-    plot_performance(best_5_samples, log_dir, tier_name = "best")
-    plot_performance(worst_5_samples, log_dir, tier_name = "worst")
- 
-    # --- persist raw loss values + plot, as required by the assignment ---
-    csv_path = os.path.join(log_dir, "loss_metrics.csv")
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_l1"])
-        writer.writeheader()
-        writer.writerows(history)
- 
-    epochs = [h["epoch"] for h in history]
-    plt.figure(figsize=(8, 5))
-    plt.plot(epochs, [h["train_loss"] for h in history], label="Train C-Diff Loss")
-    plt.plot(epochs, [h["val_l1"] for h in history], label="Val L1 Reconstruction Pixel Loss")
-    plt.xlabel("Epoch Count")
-    plt.ylabel("Loss Index")
-    plt.title("C-DiffSET Training Convergence Diagnostics Summary")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(log_dir, "loss_diagnostic_curve.png"))
-    print(f"[PROCESS COMPLETED] Logs safely cataloged to {log_dir}")
+        accelerator.wait_for_everyone()
+    
+    if accelerator.is_main_process():
+        plot_performance(best_5_samples, log_dir, tier_name = "best")
+        plot_performance(worst_5_samples, log_dir, tier_name = "worst")
+    
+        # --- persist raw loss values + plot, as required by the assignment ---
+        csv_path = os.path.join(log_dir, "loss_metrics.csv")
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_l1"])
+            writer.writeheader()
+            writer.writerows(history)
+    
+        epochs = [h["epoch"] for h in history]
+        plt.figure(figsize=(8, 5))
+        plt.plot(epochs, [h["train_loss"] for h in history], label="Train C-Diff Loss")
+        plt.plot(epochs, [h["val_l1"] for h in history], label="Val L1 Reconstruction Pixel Loss")
+        plt.xlabel("Epoch Count")
+        plt.ylabel("Loss Index")
+        plt.title("C-DiffSET Training Convergence Diagnostics Summary")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(log_dir, "loss_diagnostic_curve.png"))
+        print(f"[PROCESS COMPLETED] Logs safely cataloged to {log_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
