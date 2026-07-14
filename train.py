@@ -10,111 +10,79 @@ import csv
 import os
 import random
 import time
- 
+import yaml
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.amp import autocast, GradScaler
-import yaml
 from torch.utils.data import DataLoader
- 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+from diffusers import AutoencoderKL, DDPMScheduler
  
 from src.dataset import SAR2EODataset, list_roi_ids, split_roi_ids
-from src.model import UNetGenerator, PatchGANDiscriminator
+from src.model import CDiffSETUNet
 
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-def get_perceptual_loss_fn(device):
-    from torchvision.models import VGG16_Weights, vgg16
     
-    vgg = vgg16(weights = VGG16_Weights.IMAGENET1K_V1).features.to(device).eval()
-    for p in vgg.parameters():
-        p.requires_grad = False
-    layer_ids = {8: "relu2_2", 15: "relu3_3"}
-    
-    def extract(x):
-        # x is in [-1, 1] (3-channel); VGG expects ImageNet-normalized [0, 1] input.
-        x = (x + 1.0) / 2.0
-        mean = torch.tensor([0.485, 0.456, 0.406], device = x.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device = x.device).view(1, 3, 1, 1)
-        x = (x - mean) / std
-        
-        feats = []
-        for i, layer in enumerate(vgg):
-            x = layer(x)
-            if i in layer_ids:
-                feats.append(x)
-            if i == max(layer_ids):
-                break  
-        return feats
-
-    def loss_fn(fake, real):
-        feats_fake, feats_real = extract(fake), extract(real)
-        return sum(nn.functional.l1_loss(a, b) for a, b in zip(feats_fake, feats_real)) 
-
-    return loss_fn
-
-def save_checkpoint(path, epoch, G, D, opt_G, opt_D, scaler_G, scaler_D, history):
+def save_checkpoint(path, epoch, model, optimizer, scaler, history):
     torch.save({
         "epoch": epoch,
-        "G_state": G.state_dict(),
-        "D_state": D.state_dict(),
-        "opt_G_state": opt_G.state_dict(),
-        "opt_D_state": opt_D.state_dict(),
-        "scaler_G_state": scaler_G.state_dict(),
-        "scaler_D_state": scaler_D.state_dict(),
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scaler_state": scaler.state_dict(),
         "history": history,
     }, path)
 
-def get_loaders(cfg, train_ds, val_ds):
-    train_loader = DataLoader(
-        train_ds, batch_size = cfg["train"]["batch_size"], shuffle = True,
-        num_workers=cfg["train"]["num_workers"], pin_memory=True, drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size = cfg["train"]["batch_size"], shuffle = True,
-        num_workers=cfg["train"]["num_workers"], pin_memory=True, drop_last=True,
-    )
-    return train_loader, val_loader
-    
-def initModels(cfg, device):
-    G = UNetGenerator(cfg["model"]["in_ch"], cfg["model"]["out_ch"], cfg["model"]["base_channels"]).to(device)
-    D = PatchGANDiscriminator(cfg["model"]["in_ch"], cfg["model"]["out_ch"], cfg["model"]["base_channels"]).to(device)
-    return G, D
+def load_checkpoint(path, model, optimizer, scaler, device):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No training checkpoint found at {path}")
+    ckpt = torch.load(path, map_location = device)
+    model.load_state_dict(ckpt["model_state"])
+    optimizer.load_state_dict(ckpt["optimizer_state"])
+    if "scaler_state" in ckpt:
+        scaler.load_state_dict(ckpt["scaler_state"])
+    return ckpt["epoch"] + 1, ckpt["history"]
 
-# def initOptimizers(cfg, G, D):
-#     opt_G = torch.optim.Adam(G.parameters(), lr = cfg["train"]["lr"], betas=(cfg["train"]["beta1"], cfg["train"]["beta2"]))
-#     opt_D = torch.optim.Adam(D.parameters(), lr = cfg["train"]["lr"], betas=(cfg["train"]["beta1"], cfg["train"]["beta2"]))
-#     return opt_G, opt_D
-
-def initOptimizers(cfg, G, D):
-    opt_G = torch.optim.Adam(G.parameters(), lr=0.0002, betas=(0.5, 0.999))
-    opt_D = torch.optim.Adam(D.parameters(), lr=0.00005, betas=(0.5, 0.999)) # Slow D down by 4x
-    return opt_G, opt_D
-    
-def continue_training_from_last_ckpt(full_ckpt_path, G, D, opt_G, opt_D, scaler_G, scaler_D, device):
-    if not os.path.exists(full_ckpt_path):
-        raise FileNotFoundError(f"no training checkpoint found at {full_ckpt_path}")
-    
-    ckpt = torch.load(full_ckpt_path, map_location = device)
-    G.load_state_dict(ckpt["G_state"])
-    D.load_state_dict(ckpt["D_state"])
-    opt_G.load_state_dict(ckpt["opt_G_state"])
-    opt_D.load_state_dict(ckpt["opt_D_state"])
-    if "scaler_G_state" in ckpt:
-        scaler_G.load_state_dict(ckpt["scaler_G_state"])
-        scaler_D.load_state_dict(ckpt["scaler_D_state"])
-    history = ckpt["history"]
-    start_epoch = ckpt["epoch"] + 1
-    print(f"resumed from epoch {ckpt['epoch']}, continuing at epoch {start_epoch}")
-    return start_epoch, history
+def plot_performance(extreme_samples, output_dir, tier_name = "best"):
+    """
+    Plots a row matrix containing the SAR input, generated EO target, and Ground Truth EO.
+    """
+    num_samples = len(extreme_samples)
+    if num_samples == 0:
+        return
+        
+    fig, axes = plt.subplots(num_samples, 3, figsize=(10, 2 * num_samples))
+    if num_samples == 1:
+        axes = np.expand_dims(axes, axis=0)
+        
+    for idx, sample in enumerate(extreme_samples):
+        # Denormalize images from [-1, 1] to [0, 1] for visual display
+        sar = ((sample['sar'] + 1.0) / 2.0).squeeze(0).cpu().numpy()
+        pred = ((sample['pred'] + 1.0) / 2.0).transpose(1, 2, 0).cpu().numpy()
+        gt = ((sample['gt'] + 1.0) / 2.0).transpose(1, 2, 0).cpu().numpy()
+        
+        axes[idx, 0].imshow(sar, cmap='gray')
+        axes[idx, 0].set_title(f"SAR (L1: {sample['loss']:.3f})", fontsize=8)
+        axes[idx, 0].axis('off')
+        
+        axes[idx, 1].imshow(np.clip(pred, 0, 1))
+        axes[idx, 1].set_title("Generated EO", fontsize=8)
+        axes[idx, 1].axis('off')
+        
+        axes[idx, 2].imshow(np.clip(gt, 0, 1))
+        axes[idx, 2].set_title("Ground Truth", fontsize=8)
+        axes[idx, 2].axis('off')
+        
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"performance_{tier_name}.png"), dpi=150)
+    plt.close()
 
 def train_one_epoch(train_loader : DataLoader, val_loader : DataLoader):
     pass
@@ -132,14 +100,10 @@ def main(cfg_path, resume):
     log_dir = cfg["train"]["log_dir"]
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
-    full_ckpt_path = os.path.join(ckpt_dir, "training_state.pt")
+    full_ckpt_path = os.path.join(ckpt_dir, "cdiffset_state.pt")
     
     roi_ids = list_roi_ids(cfg["data"]["seasons_dir"])
-    train_ids, val_ids = split_roi_ids(roi_ids, val_frac=cfg["data"]["val_frac"], seed=cfg["seed"])
-    
-    max_train_rois = cfg["data"].get("max_train_rois")
-    if max_train_rois is not None:
-        train_ids = train_ids[:max_train_rois]
+    train_ids, val_ids = split_roi_ids(roi_ids, val_frac = cfg["data"]["val_frac"], seed = cfg["seed"])
     
     print(f"{len(roi_ids)} ROI scenes total -> {len(train_ids)} train / {len(val_ids)} val")
     
@@ -147,27 +111,29 @@ def main(cfg_path, resume):
     val_ds = SAR2EODataset(cfg["data"]["seasons_dir"], val_ids)
     print(f"train pairs: {len(train_ds)}, val pairs: {len(val_ds)}")
     
-    train_loader, val_loader = get_loaders(cfg, train_ds, val_ds)
+    train_loader = DataLoader(train_ds, batch_size=cfg["train"]["batch_size"], shuffle=True, num_workers=cfg["train"]["num_workers"], pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=cfg["train"]["batch_size"], shuffle=False, num_workers=cfg["train"]["num_workers"], pin_memory=True)
+        
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
     
-    G, D = initModels(cfg, device)
-    opt_G, opt_D = initOptimizers(cfg, G, D)
+    # eval mode to generate low dim latent representations of SAR and EO data
+    vae.eval()
+    for param in vae.parameters():
+        param.requires_grad = False
     
-    l1_loss = nn.L1Loss()
-    gan_loss = nn.MSELoss() if cfg["train"]["use_lsgan"] else nn.BCEWithLogitsLoss()
+    noise_scheduler = DDPMScheduler(num_train_timesteps = 1000)
+    
+    model = CDiffSETUNet(latent_channels = cfg["model"]["latent_channels"], base_channels = cfg["model"]["base_channels"]).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]), weight_decay=1e-4)
     
     use_amp = (device.type == "cuda")
-    scaler_G = GradScaler(device.type, enabled = use_amp)
-    scaler_D = GradScaler(device.type, enabled = use_amp)
-    
-    lambda_l1 = cfg["train"]["lambda_l1"]
-    lambda_perc = cfg["train"]["lambda_perceptual"]
-    perceptual_loss_fn = get_perceptual_loss_fn(device) if lambda_perc > 0 else None
+    scaler = GradScaler(device.type, enabled=use_amp)
     
     start_epoch = 1
     history = []  # per-epoch: epoch, g_loss, d_loss, val_l1
     
     if resume:
-        start_epoch, history = continue_training_from_last_ckpt(full_ckpt_path, G, D, opt_G, opt_D, scaler_G, scaler_D, device)
+        start_epoch, history = load_checkpoint(full_ckpt_path, model, optimizer, scaler, device)
     
     total_epochs = cfg["train"]["epochs"]
     if(start_epoch > total_epochs):
@@ -177,98 +143,113 @@ def main(cfg_path, resume):
     for epoch in range(start_epoch, total_epochs + 1):
         epoch_start = time.perf_counter()
         
-        G.train()
-        D.train()
-        g_losses, d_losses, g_adv_losses, g_l1_losses = [], [], [], []
+        model.train()
+        train_losses = []
  
         for sar, eo in train_loader:
             sar, eo = sar.to(device), eo.to(device)
-            with autocast(device_type = device.type, enabled = use_amp):
-                fake_eo = G(sar)
- 
-            # --- train discriminator ---
-            opt_D.zero_grad()
-            with autocast(device_type = device.type, enabled = use_amp):
-                pred_real = D(sar, eo)
-                pred_fake_for_d = D(sar, fake_eo.detach())
-                valid = torch.ones_like(pred_real)
-                fake_label = torch.zeros_like(pred_real)
+            
+            with torch.no_grad():
+                # Replicate single channel SAR to fit 3-channel RGB VAE expectations
+                sar_rgb = torch.cat([sar, sar, sar], dim = 1) if sar.shape[1] == 1 else sar
                 
-                d_loss = 0.5 * (gan_loss(pred_real, valid) + gan_loss(pred_fake_for_d, fake_label))
-
-            scaler_D.scale(d_loss).backward()
-            scaler_D.step(opt_D)
-            scaler_D.update()
- 
-            # --- train generator ---
-            opt_G.zero_grad()
+                # Shape : (B, 4, 32, 32)
+                z_x = vae.encode(sar_rgb).latent_dist.sample() * 0.18215 
+                # Shape : (B, 4, 32, 32) 
+                z_y = vae.encode(eo).latent_dist.sample() * 0.18215
+            
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (sar.shape[0],), device = device).long()
+            noise = torch.randn_like(z_y)
+            
+            z_y_noisy = noise_scheduler.add_noise(z_y, noise, timesteps)
+            
+            # combined input : Shape: (B, 4*2, 32, 32)
+            u_net_input = torch.cat([z_x, z_y_noisy], dim = 1)
+            
+            optimizer.zero_grad()
             with autocast(device_type = device.type, enabled = use_amp):
-                pred_fake_for_g = D(sar, fake_eo)
-                g_adv = gan_loss(pred_fake_for_g, valid)
-                g_l1 = l1_loss(fake_eo, eo) * lambda_l1
-                g_loss = g_adv + g_l1
-                if perceptual_loss_fn is not None:
-                    g_loss = g_loss + perceptual_loss_fn(fake_eo, eo) * lambda_perc
-                    
-            scaler_G.scale(g_loss).backward()
-            scaler_G.step(opt_G)
-            scaler_G.update()
- 
-            g_losses.append(g_loss.item())
-            d_losses.append(d_loss.item())
-            g_adv_losses.append(g_adv.item())
-            g_l1_losses.append(g_l1.item())
- 
-        # --- validation (L1 only here; run eval.py separately for LPIPS/FID/SSIM/PSNR) ---
-        G.eval()
-        val_l1s = []
+                pred_noise, confidence = model(u_net_input, timesteps)
+                
+                # Dynamic Confidence Weighted Loss execution (C-Diff objective)
+                noise_residual = torch.square(noise - pred_noise)
+                
+                # L_C_Diff = (noise - pred noise)^2 * confidence_map - log(confidence_map + 1e-6) (to prvent log 0)
+                loss_map = noise_residual * confidence - torch.log(confidence + 1e-6)
+                loss = loss_map.mean()
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            train_losses.append(loss.item())
+        
+        model.eval()
+        all_val_records = []
+        l1_metric = nn.L1Loss(reduction='none')
+        
         with torch.no_grad():
             for sar, eo in val_loader:
                 sar, eo = sar.to(device), eo.to(device)
-                fake_eo = G(sar)
-                val_l1s.append(l1_loss(fake_eo, eo).item())
+                
+                sar_rgb = torch.cat([sar, sar, sar], dim=1) if sar.shape[1] == 1 else sar
+                z_x = vae.encode(sar_rgb).latent_dist.sample() * 0.18215 
+                
+                # perform an abbreviated reverse denoising loop step for eval verification
+                z_t = torch.rand_like(z_x)    
+                eval_t = torch.full((sar.shape[0],), 50, device = device).long()
+                
+                noisy_sar_latent_input = torch.concat([z_x, z_t], dim = 1)
+                pred_noise, _ = model(noisy_sar_latent_input, eval_t)
+                
+                # direct step reconstruction (removing pred noise from noisy sar => denoising step)
+                z_denoised = (z_t - pred_noise)
+                
+                decoded_output = vae.decode(z_denoised / 0.18215).sample
+                
+                # directly compute l1 pixel loss [netween generated eo (decoded o/p) and eo]
+                batch_l1 = l1_metric(decoded_output, eo).mean(dim = [1, 2, 3])
+            
+                for idx in range(sar.shape[0]):
+                    all_val_records.append({
+                        'loss': batch_l1[idx].item(),
+                        'sar': sar[idx].cpu(),
+                        'pred': decoded_output[idx].cpu(),
+                        'gt': eo[idx].cpu()
+                    })
+            
+        all_val_records.sort(key = lambda item : item['loss'])
+        best_5_samples = all_val_records[:5]    
+        worst_5_samples = all_val_records[-5:]    
+        mean_val_l1 = np.mean([item['loss'] for item in all_val_records])
             
         elapsed_time = time.perf_counter() - epoch_start
- 
-        mean_g = float(np.mean(g_losses))
-        mean_d = float(np.mean(d_losses))
-        mean_g_adv = float(np.mean(g_adv_losses))
-        mean_g_l1 = float(np.mean(g_l1_losses))
-        mean_val = float(np.mean(val_l1s))
+        mean_train_loss = np.mean(train_losses)
+        print(f"Epoch {epoch:03d}/{total_epochs} | Train Loss: {mean_train_loss:.4f} | Val L1 Error: {mean_val_l1:.4f} | Time: {elapsed_time:.1f}s")
         
-        print(
-            f"epoch {epoch:03d}/{total_epochs} | G {mean_g:.4f} (adv {mean_g_adv:.4f} + l1 {mean_g_l1:.4f}) "
-            f"| D {mean_d:.4f} | val_L1 {mean_val:.4f} | time {elapsed_time:.1f}s"
-        )
-        
-        history.append({
-            "epoch": epoch, "g_loss": mean_g, "g_adv": mean_g_adv, "g_l1": mean_g_l1,
-            "d_loss": mean_d, "val_l1": mean_val,
-        })
-        
-        # full state (for resuming) + plain generator weights (for eval.py / infer.py)
-        save_checkpoint(full_ckpt_path, epoch, G, D, opt_G, opt_D, scaler_G, scaler_D, history)
-        torch.save(G.state_dict(), os.path.join(ckpt_dir, "generator_latest.pt"))
+        history.append({"epoch": epoch, "train_loss": mean_train_loss, "val_l1": mean_val_l1})
+        save_checkpoint(full_ckpt_path, epoch, model, optimizer, scaler, history)
+
+    plot_performance(best_5_samples, log_dir, tier_name = "best")
+    plot_performance(worst_5_samples, log_dir, tier_name = "worst")
  
     # --- persist raw loss values + plot, as required by the assignment ---
-    csv_path = os.path.join(log_dir, "loss_history.csv")
+    csv_path = os.path.join(log_dir, "loss_metrics.csv")
     with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["epoch", "g_loss", "d_loss", "val_l1"])
+        writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_l1"])
         writer.writeheader()
         writer.writerows(history)
  
     epochs = [h["epoch"] for h in history]
     plt.figure(figsize=(8, 5))
-    plt.plot(epochs, [h["g_loss"] for h in history], label="Generator loss (train)")
-    plt.plot(epochs, [h["d_loss"] for h in history], label="Discriminator loss (train)")
-    plt.plot(epochs, [h["val_l1"] for h in history], label="Validation L1")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training / validation loss")
+    plt.plot(epochs, [h["train_loss"] for h in history], label="Train C-Diff Loss")
+    plt.plot(epochs, [h["val_l1"] for h in history], label="Val L1 Reconstruction Pixel Loss")
+    plt.xlabel("Epoch Count")
+    plt.ylabel("Loss Index")
+    plt.title("C-DiffSET Training Convergence Diagnostics Summary")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(log_dir, "loss_curve.png"))
-    print(f"saved loss history to {csv_path} and loss_curve.png")
+    plt.savefig(os.path.join(log_dir, "loss_diagnostic_curve.png"))
+    print(f"[PROCESS COMPLETED] Logs safely cataloged to {log_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
