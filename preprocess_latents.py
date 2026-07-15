@@ -33,7 +33,7 @@ def main(cfg_path):
     dataset = SAR2EODataset(cfg["data"]["seasons_dir"], all_ids)
     
     # Standard DataLoader (Accelerate will convert this into a Distributed Dataloader)  
-    loader = DataLoader(dataset, batch_size = cfg["train"]["batch_size"], shuffle=False, num_workers = cfg["train"]["num_workers"], pin_memory=True)
+    loader = DataLoader(dataset, batch_size = 16, shuffle=False, num_workers = cfg["train"]["num_workers"], pin_memory=True)
     
     # Initialize frozen VAE engine
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
@@ -47,12 +47,13 @@ def main(cfg_path):
         print(f"Beginning VAE latent rep generation across entire data [{len(dataset)} pairs]..")
     
     with torch.no_grad():
-        for batch_idx, (sar, eo) in enumerate(tqdm(loader)):            
-            sar_rgb = torch.cat([sar, sar, sar], dim = 1) if sar.shape[1] == 1 else sar
-            
-            # compress inputs down into standard 4-channel latents
-            z_x = vae.encode(sar_rgb).latent_dist.sample() * 0.18215 # (B, 4, 32, 32)
-            z_y = vae.encode(eo).latent_dist.sample() * 0.18215      # (B, 4, 32, 32)
+        for batch_idx, (sar, eo) in enumerate(tqdm(loader)):       
+            with torch.amp.autocast(device_type = "cuda", dtype = torch.float16):     
+                sar_rgb = torch.cat([sar, sar, sar], dim = 1) if sar.shape[1] == 1 else sar
+                
+                # compress inputs down into standard 4-channel latents
+                z_x = vae.encode(sar_rgb).latent_dist.sample() * 0.18215 # (B, 4, 32, 32)
+                z_y = vae.encode(eo).latent_dist.sample() * 0.18215      # (B, 4, 32, 32)
             
             # unpack batch instances and save them individually to disk
             for idx in range(sar.shape[0]):
