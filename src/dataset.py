@@ -57,13 +57,16 @@ def find_roi_pairs(season_dir : str, roi_id : str) -> List[Tuple[str, str]]:
     
     if not (os.path.isdir(sar_dir) and os.path.isdir(eo_dir)): return [] 
     
+    eo_files_in_dir = set(os.listdir(eo_dir))
+    
     pairs = []
     for sar_path in sorted(glob.glob(os.path.join(sar_dir, "*.png"))):
         sar_filename = os.path.basename(sar_path)
         eo_filename = sar_filename_to_eo_filename(sar_filename)
-        eo_path = os.path.join(eo_dir, eo_filename)
-        if os.path.exists(eo_path):
+        if eo_filename in eo_files_in_dir:
+            eo_path = os.path.join(eo_dir, eo_filename)
             pairs.append((sar_path, eo_path))
+            
     return pairs
 
 def build_pairs(season_dir : str, roi_ids : List[str]) -> List[Tuple[str, str]]:
@@ -118,6 +121,40 @@ class SAR2EODataset(Dataset):
     def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor]:
         sar_path, eo_path = self.pairs[idx]
         return load_sar_patch(sar_path), load_eo_patch(eo_path) 
+
+class PrecomputedLatentDataset(Dataset):
+    """
+    High-performance dataset engine that bypasses raw images completely.
+    Directly loads pre-computed 4-channel latents (B, 4, 32, 32) from memory caches 
+    """
+    def __init__(self, seasons_dir : str, roi_ids : List[str], latent_dir : str):
+        self.latent_dir = latent_dir 
+        raw_pairs = build_pairs(season_dir, roi_ids)
+        
+        self.latent_pairs = []
+        for sar_path, eo_path in self.raw_pairs:
+            sar_name = os.path.splitext(os.path.basename(sar_path))[0]
+            eo_name = os.path.splitext(os.path.basename(eo_path))[0]
+            
+            sar_latent_path = os.path.join(latent_dir, f"{sar_name}.pt")
+            eo_latent_path = os.path.join(latent_dir, f"{eo_name}.pt")
+            
+            if os.path.exists(sar_latent_path) and os.path.exists(eo_latent_path):
+                self.latent_pairs.append((sar_latent_path, eo_latent_path))
+        
+        if len(self.latent_pairs) == 0:
+            raise RuntimeError(f"No matching precomputed latent tensors found under: {latent_dir}")
+        
+    def __len__(self) -> int:
+        return len(self.latent_pairs) 
+    
+    def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor]:
+        sar_latent_path, eo_latent_path = self.latent_pairs[idx] 
+        
+        # load only the precomputed latent vector representations for current pair
+        z_x = torch.load(sar_latent_path, weights_only = True)  # (4, 32, 32)
+        z_y = torch.load(eo_latent_path, weights_only = True)   # (4, 32, 32)
+        return z_x, z_y
     
     
 if __name__ == "__main__":

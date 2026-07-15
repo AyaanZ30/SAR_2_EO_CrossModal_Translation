@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 from accelerate import Accelerator
 from diffusers import AutoencoderKL, DDPMScheduler
  
-from src.dataset import SAR2EODataset, list_roi_ids, split_roi_ids
+from src.dataset import list_roi_ids, split_roi_ids, PrecomputedLatentDataset
 from src.model import CDiffSETUNet
 
 def set_seed(seed):
@@ -96,8 +96,6 @@ def main(cfg_path, resume):
     set_seed(cfg["seed"])
     
     accelerator = Accelerator(mixed_precision = "fp16" if torch.cuda.is_available() else "no")
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # print(f"using device: {device}")
     device = accelerator.device
     
     ckpt_dir = cfg["train"]["checkpoint_dir"]
@@ -112,35 +110,28 @@ def main(cfg_path, resume):
     roi_ids = list_roi_ids(cfg["data"]["seasons_dir"])
     train_ids, val_ids = split_roi_ids(roi_ids, val_frac = cfg["data"]["val_frac"], seed = cfg["seed"])
     
-    print(f"{len(roi_ids)} ROI scenes total -> {len(train_ids)} train / {len(val_ids)} val")
+    if accelerator.is_main_process:
+        print(f"{len(roi_ids)} ROI scenes total -> {len(train_ids)} train / {len(val_ids)} val")
     
-    train_ds = SAR2EODataset(cfg["data"]["seasons_dir"], train_ids)
-    val_ds = SAR2EODataset(cfg["data"]["seasons_dir"], val_ids)
-    print(f"train pairs: {len(train_ds)}, val pairs: {len(val_ds)}")
+    train_ds = PrecomputedLatentDataset(cfg["data"]["seasons_dir"], train_ids, cfg["train"]["vae_output_dir"])
+    val_ds = PrecomputedLatentDataset(cfg["data"]["seasons_dir"], val_ids, cfg["train"]["vae_output_dir"])
+    
+    if accelerator.is_main_process:
+        print(f"Train latent pairs: {len(train_ds)}, Val latent pairs: {len(val_ds)}")
     
     train_loader = DataLoader(train_ds, batch_size=cfg["train"]["batch_size"], shuffle=True, num_workers=cfg["train"]["num_workers"], pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=cfg["train"]["batch_size"], shuffle=False, num_workers=cfg["train"]["num_workers"], pin_memory=True)
-        
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
-    
-    # eval mode to generate low dim latent representations of SAR and EO data
-    vae.eval()
-    for param in vae.parameters():
-        param.requires_grad = False
     
     noise_scheduler = DDPMScheduler(num_train_timesteps = 1000)
-    model = CDiffSETUNet(latent_channels = cfg["model"]["latent_channels"], base_channels = cfg["model"]["base_channels"]).to(device)
+    model = CDiffSETUNet(latent_channels = cfg["model"]["latent_channels"], base_channels = cfg["model"]["base_channels"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]), weight_decay=1e-4)
     
     model, optimizer, train_loader, val_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader
     )
     
-    # use_amp = (device.type == "cuda")
-    # scaler = GradScaler(device.type, enabled=use_amp)
-    
     start_epoch = 1
-    history = []  # per-epoch: epoch, g_loss, d_loss, val_l1
+    history = []  
     
     if resume and os.path.exists(full_ckpt_path):
         # start_epoch, history = load_checkpoint(full_ckpt_path, model, optimizer, scaler, device)
@@ -155,22 +146,15 @@ def main(cfg_path, resume):
     for epoch in range(start_epoch, total_epochs + 1):
         epoch_start = time.perf_counter()
         
+        mean_val_l1 = 0.0
+        
         model.train()
         train_losses = []
  
-        for sar, eo in train_loader:
-            sar, eo = sar.to(device), eo.to(device)
-            
-            with torch.no_grad():
-                # Replicate single channel SAR to fit 3-channel RGB VAE expectations
-                sar_rgb = torch.cat([sar, sar, sar], dim = 1) if sar.shape[1] == 1 else sar
-                
-                # Shape : (B, 4, 32, 32)
-                z_x = vae.encode(sar_rgb).latent_dist.sample() * 0.18215 
-                # Shape : (B, 4, 32, 32) 
-                z_y = vae.encode(eo).latent_dist.sample() * 0.18215
-            
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (sar.shape[0],), device = device).long()
+        for z_x, z_y in train_loader:
+            # z_x (sar latent vector) & z_y (eo latent vec) precomputed and directly loaded from memory
+             
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (z_x.shape[0],), device = device).long()
             noise = torch.randn_like(z_y)
             
             z_y_noisy = noise_scheduler.add_noise(z_y, noise, timesteps)
@@ -180,7 +164,7 @@ def main(cfg_path, resume):
             
             optimizer.zero_grad()
             # Forward pass implicitly maps mixed-precision configurations
-            pred_noise, confidence = model(u_net_input, timesteps) #
+            pred_noise, confidence = model(u_net_input, timesteps) 
             
             noise_residual = torch.square(noise - pred_noise)
             loss_map = noise_residual * confidence - torch.log(confidence + 1e-6) #
@@ -192,21 +176,19 @@ def main(cfg_path, resume):
             train_losses.append(loss.item())
             
         if epoch % 10 == 0 or epoch == total_epochs:
-        
             model.eval()
             all_val_records = []
             l1_metric = nn.L1Loss(reduction='none')
             
+            # Load frozen VAE onto card dynamically only when evaluation metrics are compiled
+            vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
+            vae.eval()
+            
             with torch.no_grad():
-                for sar, eo in val_loader:
-                    sar, eo = sar.to(device), eo.to(device)
-                    
-                    sar_rgb = torch.cat([sar, sar, sar], dim=1) if sar.shape[1] == 1 else sar
-                    z_x = vae.encode(sar_rgb).latent_dist.sample() * 0.18215 
-                    
+                for z_x, z_y in val_loader:
                     # perform an abbreviated reverse denoising loop step for eval verification
                     z_t = torch.rand_like(z_x)    
-                    eval_t = torch.full((sar.shape[0],), 50, device = device).long()
+                    eval_t = torch.full((z_x.shape[0],), 50, device = device).long()
                     
                     noisy_sar_latent_input = torch.concat([z_x, z_t], dim = 1)
                     pred_noise, _ = model(noisy_sar_latent_input, eval_t)
@@ -217,25 +199,32 @@ def main(cfg_path, resume):
                     decoded_output = vae.decode(z_denoised / 0.18215).sample
                     
                     # Gather individual tensors back across process boundaries safely
-                    gathered_sar, gathered_eo, gathered_pred = accelerator.gather_for_metrics((sar, eo, decoded_output))
+                    gathered_z_x, gathered_z_y, gathered_pred = accelerator.gather_for_metrics((z_x, z_y, decoded_output))
+                    
+                    decoded_sar = vae.decode(gathered_z_x / 0.18215).sample
+                    decoded_gt = vae.decode(gathered_z_y / 0.18215).sample
                     
                     # directly compute l1 pixel loss [netween generated eo (decoded o/p) and eo]
-                    # batch_l1 = l1_metric(decoded_output, eo).mean(dim = [1, 2, 3])
-                    batch_l1 = l1_metric(gathered_pred, gathered_eo).mean(dim = [1, 2, 3])
+                    batch_l1 = l1_metric(gathered_pred, decoded_gt).mean(dim = [1, 2, 3])
                 
-                    for idx in range(sar.shape[0]):
+                    for idx in range(gathered_z_x.shape[0]):
                         all_val_records.append({
                             'loss': batch_l1[idx].item(),
-                            'sar': sar[idx].cpu(),
-                            'pred': decoded_output[idx].cpu(),
-                            'gt': eo[idx].cpu()
+                            'sar': decoded_sar[idx].cpu(),
+                            'pred': gathered_pred[idx].cpu(),
+                            'gt': decoded_gt[idx].cpu()
                         })
                     
+                    
+            del vae
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
                 
             if accelerator.is_main_process:
                 all_val_records.sort(key = lambda item : item['loss'])
                 best_5_samples = all_val_records[:5]    
-                worst_5_samples = all_val_records[-5:]    
+                worst_5_samples = all_val_records[-5:]   
+                 
                 mean_val_l1 = np.mean([item['loss'] for item in all_val_records])
                 
                 plot_performance(best_5_samples, log_dir, tier_name=f"best_epoch_{epoch}")
@@ -248,6 +237,7 @@ def main(cfg_path, resume):
             print(f"Epoch {epoch:03d}/{total_epochs} | Train Loss: {mean_train_loss:.4f} | Val L1 Error: {mean_val_l1:.4f} | Time: {elapsed_time:.1f}s")
             
             history.append({"epoch": epoch, "train_loss": mean_train_loss, "val_l1": mean_val_l1})
+            
             # save_checkpoint(full_ckpt_path, epoch, model, optimizer, scaler, history)
             torch.save({
                 "epoch": epoch,
