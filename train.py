@@ -186,57 +186,63 @@ def main(cfg_path, resume):
             loss_map = noise_residual * confidence - torch.log(confidence + 1e-6) #
             loss = loss_map.mean()
             
-            # scaler.scale(loss).backward()
-            # scaler.step(optimizer)
-            # scaler.update()
             accelerator.backward(loss)
             optimizer.step()
             
             train_losses.append(loss.item())
-        
-        model.eval()
-        all_val_records = []
-        l1_metric = nn.L1Loss(reduction='none')
-        
-        with torch.no_grad():
-            for sar, eo in val_loader:
-                sar, eo = sar.to(device), eo.to(device)
-                
-                sar_rgb = torch.cat([sar, sar, sar], dim=1) if sar.shape[1] == 1 else sar
-                z_x = vae.encode(sar_rgb).latent_dist.sample() * 0.18215 
-                
-                # perform an abbreviated reverse denoising loop step for eval verification
-                z_t = torch.rand_like(z_x)    
-                eval_t = torch.full((sar.shape[0],), 50, device = device).long()
-                
-                noisy_sar_latent_input = torch.concat([z_x, z_t], dim = 1)
-                pred_noise, _ = model(noisy_sar_latent_input, eval_t)
-                
-                # direct step reconstruction (removing pred noise from noisy sar => denoising step)
-                z_denoised = (z_t - pred_noise)
-                
-                decoded_output = vae.decode(z_denoised / 0.18215).sample
-                
-                # Gather individual tensors back across process boundaries safely
-                gathered_sar, gathered_eo, gathered_pred = accelerator.gather_for_metrics((sar, eo, decoded_output))
-                
-                # directly compute l1 pixel loss [netween generated eo (decoded o/p) and eo]
-                batch_l1 = l1_metric(decoded_output, eo).mean(dim = [1, 2, 3])
             
-                for idx in range(sar.shape[0]):
-                    all_val_records.append({
-                        'loss': batch_l1[idx].item(),
-                        'sar': sar[idx].cpu(),
-                        'pred': decoded_output[idx].cpu(),
-                        'gt': eo[idx].cpu()
-                    })
+        if epoch % 10 == 0 or epoch == total_epochs:
+        
+            model.eval()
+            all_val_records = []
+            l1_metric = nn.L1Loss(reduction='none')
             
-        if accelerator.is_main_process():
-            all_val_records.sort(key = lambda item : item['loss'])
-            best_5_samples = all_val_records[:5]    
-            worst_5_samples = all_val_records[-5:]    
-            mean_val_l1 = np.mean([item['loss'] for item in all_val_records])
+            with torch.no_grad():
+                for sar, eo in val_loader:
+                    sar, eo = sar.to(device), eo.to(device)
+                    
+                    sar_rgb = torch.cat([sar, sar, sar], dim=1) if sar.shape[1] == 1 else sar
+                    z_x = vae.encode(sar_rgb).latent_dist.sample() * 0.18215 
+                    
+                    # perform an abbreviated reverse denoising loop step for eval verification
+                    z_t = torch.rand_like(z_x)    
+                    eval_t = torch.full((sar.shape[0],), 50, device = device).long()
+                    
+                    noisy_sar_latent_input = torch.concat([z_x, z_t], dim = 1)
+                    pred_noise, _ = model(noisy_sar_latent_input, eval_t)
+                    
+                    # direct step reconstruction (removing pred noise from noisy sar => denoising step)
+                    z_denoised = (z_t - pred_noise)
+                    
+                    decoded_output = vae.decode(z_denoised / 0.18215).sample
+                    
+                    # Gather individual tensors back across process boundaries safely
+                    gathered_sar, gathered_eo, gathered_pred = accelerator.gather_for_metrics((sar, eo, decoded_output))
+                    
+                    # directly compute l1 pixel loss [netween generated eo (decoded o/p) and eo]
+                    # batch_l1 = l1_metric(decoded_output, eo).mean(dim = [1, 2, 3])
+                    batch_l1 = l1_metric(gathered_pred, gathered_eo).mean(dim = [1, 2, 3])
                 
+                    for idx in range(sar.shape[0]):
+                        all_val_records.append({
+                            'loss': batch_l1[idx].item(),
+                            'sar': sar[idx].cpu(),
+                            'pred': decoded_output[idx].cpu(),
+                            'gt': eo[idx].cpu()
+                        })
+                    
+                
+            if accelerator.is_main_process:
+                all_val_records.sort(key = lambda item : item['loss'])
+                best_5_samples = all_val_records[:5]    
+                worst_5_samples = all_val_records[-5:]    
+                mean_val_l1 = np.mean([item['loss'] for item in all_val_records])
+                
+                plot_performance(best_5_samples, log_dir, tier_name=f"best_epoch_{epoch}")
+                plot_performance(worst_5_samples, log_dir, tier_name=f"worst_epoch_{epoch}")
+                
+            
+        if accelerator.is_main_process:    
             elapsed_time = time.perf_counter() - epoch_start
             mean_train_loss = np.mean(train_losses)
             print(f"Epoch {epoch:03d}/{total_epochs} | Train Loss: {mean_train_loss:.4f} | Val L1 Error: {mean_val_l1:.4f} | Time: {elapsed_time:.1f}s")
@@ -252,10 +258,7 @@ def main(cfg_path, resume):
         
         accelerator.wait_for_everyone()
     
-    if accelerator.is_main_process():
-        plot_performance(best_5_samples, log_dir, tier_name = "best")
-        plot_performance(worst_5_samples, log_dir, tier_name = "worst")
-    
+    if accelerator.is_main_process:
         # --- persist raw loss values + plot, as required by the assignment ---
         csv_path = os.path.join(log_dir, "loss_metrics.csv")
         with open(csv_path, "w", newline="") as f:
