@@ -66,8 +66,8 @@ def plot_performance(extreme_samples, output_dir, tier_name = "best"):
     for idx, sample in enumerate(extreme_samples):
         # Denormalize images from [-1, 1] to [0, 1] for visual display
         sar = ((sample['sar'] + 1.0) / 2.0).squeeze(0).cpu().numpy()
-        pred = ((sample['pred'] + 1.0) / 2.0).transpose(1, 2, 0).cpu().numpy()
-        gt = ((sample['gt'] + 1.0) / 2.0).transpose(1, 2, 0).cpu().numpy()
+        pred = ((sample['pred'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
+        gt = ((sample['gt'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
         
         axes[idx, 0].imshow(sar, cmap='gray')
         axes[idx, 0].set_title(f"SAR (L1: {sample['loss']:.3f})", fontsize=8)
