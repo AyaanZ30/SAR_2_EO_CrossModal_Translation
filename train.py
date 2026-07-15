@@ -88,6 +88,20 @@ def plot_performance(extreme_samples, output_dir, tier_name = "best"):
     plt.savefig(os.path.join(output_dir, f"performance_{tier_name}.png"), dpi=150)
     plt.close()
 
+@torch.no_grad()    
+def sample(model, scheduler, z_sar, device, num_inference_steps = 50):
+    """Iterative DDPM reverse sampling conditioned on a SAR latent (more sophisticated than subtraction of noise)"""
+    sched = DDPMScheduler(num_train_timesteps = scheduler.config.num_train_timesteps)
+    sched.set_timesteps(num_inference_steps, device=device)
+    
+    z_t = torch.randn_like(z_sar, device = device)
+    for t in sched.timesteps:
+        model_input = torch.cat([z_sar, z_t], dim = 1)
+        t_batch = torch.full((z_sar.shape[0],), t, device=device, dtype=torch.long)
+        pred_noise, _ = model(model_input, t_batch)
+        z_t = sched.step(pred_noise, t, z_t).prev_sample
+    return z_t 
+
 def train_one_epoch(train_loader : DataLoader, val_loader : DataLoader):
     pass
     
@@ -192,32 +206,26 @@ def main(cfg_path, resume):
             with torch.no_grad():
                 for z_x, z_y in val_loader:
                     # perform an abbreviated reverse denoising loop step for eval verification
-                    # z_t = torch.rand_like(z_x)    
-                    z_t = torch.rand_like(z_y)    
+                    noise = torch.randn_like(z_y)    
                     eval_t = torch.full((z_x.shape[0],), 50, device = device).long()
                     
-                    noisy_sar_latent_input = torch.concat([z_x, z_t], dim = 1)
-                    pred_noise, _ = model(noisy_sar_latent_input, eval_t)
+                    z_y_noisy = noise_scheduler.add_noise(z_y, noise, eval_t)
                     
-                    # direct step reconstruction (removing pred noise from noisy sar => denoising step)
-                    z_denoised = (z_t - pred_noise)
-                    
-                    # decoded_output = vae.decode(z_denoised / 0.18215).sample
-                    
+                    noisy_input = torch.concat([z_x, z_y_noisy], dim = 1)
+                    pred_noise, _ = model(noisy_input, eval_t)
+            
                     # Gather individual tensors back across process boundaries safely
-                    gathered_z_x, gathered_z_y, gathered_pred = accelerator.gather_for_metrics((z_x, z_y, z_denoised))
-                    
-                    # decoded_sar = vae.decode(gathered_z_x / 0.18215).sample
-                    # decoded_gt = vae.decode(gathered_z_y / 0.18215).sample
+                    gathered_z_x, gathered_z_y, gathered_pred_noise, gathered_noise = accelerator.gather_for_metrics(
+                        (z_x, z_y, pred_noise, noise)
+                    )
                     
                     # directly compute l1 pixel loss [netween generated eo (decoded o/p) and eo]
-                    batch_l1 = l1_metric(gathered_pred, gathered_z_y).mean(dim = [1, 2, 3])
+                    batch_l1 = l1_metric(gathered_pred_noise, gathered_noise).mean(dim = [1, 2, 3])
                 
                     for idx in range(gathered_z_x.shape[0]):
                         all_val_records.append({
                             'loss': batch_l1[idx].item(),
                             'sar_lat': gathered_z_x[idx].cpu(),
-                            'pred_lat': gathered_pred[idx].cpu(),
                             'gt_lat': gathered_z_y[idx].cpu()
                         })
                     
@@ -231,18 +239,23 @@ def main(cfg_path, resume):
                 
                 def decode_records(records_list):
                     decoded_samples = []
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    unwrapped_model.eval()
+                    
                     for item in records_list:
                         # Add batch axis, push to device, decode to pixels, and strip batch axis
                         z_sar = item['sar_lat'].unsqueeze(0).to("cpu")
-                        z_pred = item['pred_lat'].unsqueeze(0).to("cpu")
                         z_gt = item['gt_lat'].unsqueeze(0).to("cpu")
+                        
+                        z_gen = sample(unwrapped_model, noise_scheduler, z_sar, device, num_inference_steps = 50)
                         
                         decoded_samples.append({
                             'loss': item['loss'],
-                            'sar': vae.decode(z_sar / 0.18215).sample.squeeze(0),
-                            'pred': vae.decode(z_pred / 0.18215).sample.squeeze(0),
+                            'sar': vae.decode(z_sar.cpu() / 0.18215).sample.squeeze(0),
+                            'pred': vae.decode(z_gen.cpu() / 0.18215).sample.squeeze(0),
                             'gt': vae.decode(z_gt / 0.18215).sample.squeeze(0)
                         })
+                        
                     return decoded_samples
 
                 best_5_samples = decode_records(best_5_samples)
