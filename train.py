@@ -126,6 +126,11 @@ def main(cfg_path, resume):
     model = CDiffSETUNet(latent_channels = cfg["model"]["latent_channels"], base_channels = cfg["model"]["base_channels"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]), weight_decay=1e-4)
     
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to("cpu")
+    vae.eval()
+    for param in vae.parameters():
+        param.requires_grad = False
+        
     model, optimizer, train_loader, val_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader
     )
@@ -220,10 +225,6 @@ def main(cfg_path, resume):
                  
                 mean_val_l1 = np.mean([item['loss'] for item in all_val_records])
                 
-                # ───► ONLY LOAD VAE ONCE HERE TO PLOT THE 10 EXTREME IMAGES ◄───
-                vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to("cpu")
-                vae.eval()
-                
                 def decode_records(records_list):
                     decoded_samples = []
                     for item in records_list:
@@ -244,11 +245,7 @@ def main(cfg_path, resume):
                 worst_5_samples = decode_records(worst_5_samples)
                 
                 plot_performance(best_5_samples, log_dir, tier_name=f"best_epoch_{epoch}")
-                plot_performance(worst_5_samples, log_dir, tier_name=f"worst_epoch_{epoch}")
-                
-                del vae
-                
-                
+                plot_performance(worst_5_samples, log_dir, tier_name=f"worst_epoch_{epoch}")                
             
         if accelerator.is_main_process:    
             elapsed_time = time.perf_counter() - epoch_start
