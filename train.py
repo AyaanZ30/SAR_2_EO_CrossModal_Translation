@@ -195,7 +195,7 @@ def main(cfg_path, resume):
                     # decoded_output = vae.decode(z_denoised / 0.18215).sample
                     
                     # Gather individual tensors back across process boundaries safely
-                    gathered_z_x, gathered_z_y, gathered_pred = accelerator.gather_for_metrics((z_x, z_y, decoded_output))
+                    gathered_z_x, gathered_z_y, gathered_pred = accelerator.gather_for_metrics((z_x, z_y, z_denoised))
                     
                     # decoded_sar = vae.decode(gathered_z_x / 0.18215).sample
                     # decoded_gt = vae.decode(gathered_z_y / 0.18215).sample
