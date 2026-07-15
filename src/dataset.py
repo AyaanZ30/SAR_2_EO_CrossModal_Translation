@@ -129,7 +129,7 @@ class PrecomputedLatentDataset(Dataset):
     """
     def __init__(self, seasons_dir : str, roi_ids : List[str], latent_dir : str):
         self.latent_dir = latent_dir 
-        raw_pairs = build_pairs(seasons_dir, roi_ids)
+        self.raw_pairs = build_pairs(seasons_dir, roi_ids)
         
         self.latent_pairs = []
         for sar_path, eo_path in self.raw_pairs:
