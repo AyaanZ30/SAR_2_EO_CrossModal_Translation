@@ -227,15 +227,15 @@ def main(cfg_path, resume):
                     decoded_samples = []
                     for item in records_list:
                         # Add batch axis, push to device, decode to pixels, and strip batch axis
-                        z_sar = item['sar_lat'].unsqueeze(0).to(device)
-                        z_pred = item['pred_lat'].unsqueeze(0).to(device)
-                        z_gt = item['gt_lat'].unsqueeze(0).to(device)
+                        z_sar = item['sar_lat'].unsqueeze(0).to("cpu")
+                        z_pred = item['pred_lat'].unsqueeze(0).to("cpu")
+                        z_gt = item['gt_lat'].unsqueeze(0).to("cpu")
                         
                         decoded_samples.append({
                             'loss': item['loss'],
-                            'sar': vae.decode(z_sar / 0.18215).sample.squeeze(0).cpu(),
-                            'pred': vae.decode(z_pred / 0.18215).sample.squeeze(0).cpu(),
-                            'gt': vae.decode(z_gt / 0.18215).sample.squeeze(0).cpu()
+                            'sar': vae.decode(z_sar / 0.18215).sample.squeeze(0),
+                            'pred': vae.decode(z_pred / 0.18215).sample.squeeze(0),
+                            'gt': vae.decode(z_gt / 0.18215).sample.squeeze(0)
                         })
                     return decoded_samples
 
@@ -246,8 +246,7 @@ def main(cfg_path, resume):
                 plot_performance(worst_5_samples, log_dir, tier_name=f"worst_epoch_{epoch}")
                 
                 del vae
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                
                 
             
         if accelerator.is_main_process:    
