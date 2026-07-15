@@ -136,7 +136,8 @@ def main(cfg_path, resume):
     if resume and os.path.exists(full_ckpt_path):
         # start_epoch, history = load_checkpoint(full_ckpt_path, model, optimizer, scaler, device)
         accelerator.wait_for_everyone()
-        ckpt = torch.load(full_ckpt_path, map_location=device)
+        ckpt = torch.load(full_ckpt_path, map_location=device, weights_only=False)
+        
         accelerator.unwrap_model(model).load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         start_epoch = ckpt["epoch"] + 1
