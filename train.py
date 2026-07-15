@@ -65,14 +65,12 @@ def plot_performance(extreme_samples, output_dir, tier_name = "best"):
         
     for idx, sample in enumerate(extreme_samples):
         # Denormalize images from [-1, 1] to [0, 1] for visual display
-        sar = ((sample['sar'] + 1.0) / 2.0).squeeze(0).cpu().numpy()
-        pred = ((sample['pred'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
-        gt = ((sample['gt'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
-        
-        # Matplotlib handles (H, W, 3) automatically, but if you pass cmap='gray' it prefers (H, W)
-        # Take just the first channel for pure grayscale plotting layout:
+        sar = ((sample['sar'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
         if sar.shape[-1] == 3:
             sar = sar[:, :, 0]
+            
+        pred = ((sample['pred'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
+        gt = ((sample['gt'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
         
         axes[idx, 0].imshow(sar, cmap='gray')
         axes[idx, 0].set_title(f"SAR (L1: {sample['loss']:.3f})", fontsize=8)
@@ -194,7 +192,8 @@ def main(cfg_path, resume):
             with torch.no_grad():
                 for z_x, z_y in val_loader:
                     # perform an abbreviated reverse denoising loop step for eval verification
-                    z_t = torch.rand_like(z_x)    
+                    # z_t = torch.rand_like(z_x)    
+                    z_t = torch.rand_like(z_y)    
                     eval_t = torch.full((z_x.shape[0],), 50, device = device).long()
                     
                     noisy_sar_latent_input = torch.concat([z_x, z_t], dim = 1)
