@@ -220,7 +220,7 @@ def main(cfg_path, resume):
                 mean_val_l1 = np.mean([item['loss'] for item in all_val_records])
                 
                 # ───► ONLY LOAD VAE ONCE HERE TO PLOT THE 10 EXTREME IMAGES ◄───
-                vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
+                vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to("cpu")
                 vae.eval()
                 
                 def decode_records(records_list):
