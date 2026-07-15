@@ -91,6 +91,7 @@ def plot_performance(extreme_samples, output_dir, tier_name = "best"):
 @torch.no_grad()    
 def sample(model, scheduler, z_sar, device, num_inference_steps = 50):
     """Iterative DDPM reverse sampling conditioned on a SAR latent (more sophisticated than subtraction of noise)"""
+    z_sar = z_sar.to(device)
     sched = DDPMScheduler(num_train_timesteps = scheduler.config.num_train_timesteps)
     sched.set_timesteps(num_inference_steps, device=device)
     
@@ -244,7 +245,8 @@ def main(cfg_path, resume):
                     
                     for item in records_list:
                         # Add batch axis, push to device, decode to pixels, and strip batch axis
-                        z_sar = item['sar_lat'].unsqueeze(0).to("cpu")
+                        # z_sar = item['sar_lat'].unsqueeze(0).to("cpu")
+                        z_sar = item['sar_lat'].unsqueeze(0).to(device)
                         z_gt = item['gt_lat'].unsqueeze(0).to("cpu")
                         
                         z_gen = sample(unwrapped_model, noise_scheduler, z_sar, device, num_inference_steps = 50)
