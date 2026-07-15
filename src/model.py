@@ -137,7 +137,8 @@ class CDiffSETUNet(nn.Module):
             nn.Conv2d(base_channels, base_channels, kernel_size = 3, padding = 1),
             nn.SiLU(),
             nn.Conv2d(base_channels, 1, kernel_size=3, padding=1),
-            nn.Softplus()
+            # nn.Softplus()
+            nn.Sigmoid()
         )
         
         # gives (4 x 4 x 32 x 32) noise preds (each pixel of 32 x 32 EO images across all 3 channels)

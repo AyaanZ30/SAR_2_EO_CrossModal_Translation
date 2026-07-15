@@ -146,7 +146,7 @@ def main(cfg_path, resume):
     for epoch in range(start_epoch, total_epochs + 1):
         epoch_start = time.perf_counter()
         
-        mean_val_l1 = 0.0
+        mean_val_l1 = float('nan')
         
         model.train()
         train_losses = []
@@ -234,7 +234,9 @@ def main(cfg_path, resume):
         if accelerator.is_main_process:    
             elapsed_time = time.perf_counter() - epoch_start
             mean_train_loss = np.mean(train_losses)
-            print(f"Epoch {epoch:03d}/{total_epochs} | Train Loss: {mean_train_loss:.4f} | Val L1 Error: {mean_val_l1:.4f} | Time: {elapsed_time:.1f}s")
+            
+            val_str = f"{mean_val_l1:.4f}" if not np.isnan(mean_val_l1) else "Skipped"
+            print(f"Epoch {epoch:03d}/{total_epochs} | Train Loss: {mean_train_loss:.4f} | Val L1 Error: {val_str} | Time: {elapsed_time:.1f}s")
             
             history.append({"epoch": epoch, "train_loss": mean_train_loss, "val_l1": mean_val_l1})
             
