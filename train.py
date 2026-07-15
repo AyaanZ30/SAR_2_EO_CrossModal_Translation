@@ -69,6 +69,11 @@ def plot_performance(extreme_samples, output_dir, tier_name = "best"):
         pred = ((sample['pred'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
         gt = ((sample['gt'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
         
+        # Matplotlib handles (H, W, 3) automatically, but if you pass cmap='gray' it prefers (H, W)
+        # Take just the first channel for pure grayscale plotting layout:
+        if sar.shape[-1] == 3:
+            sar = sar[:, :, 0]
+        
         axes[idx, 0].imshow(sar, cmap='gray')
         axes[idx, 0].set_title(f"SAR (L1: {sample['loss']:.3f})", fontsize=8)
         axes[idx, 0].axis('off')
