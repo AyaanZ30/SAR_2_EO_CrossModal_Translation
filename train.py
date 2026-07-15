@@ -206,9 +206,9 @@ def main(cfg_path, resume):
                     for idx in range(gathered_z_x.shape[0]):
                         all_val_records.append({
                             'loss': batch_l1[idx].item(),
-                            'sar': gathered_z_x[idx].cpu(),
-                            'pred': gathered_pred[idx].cpu(),
-                            'gt': gathered_z_y[idx].cpu()
+                            'sar_lat': gathered_z_x[idx].cpu(),
+                            'pred_lat': gathered_pred[idx].cpu(),
+                            'gt_lat': gathered_z_y[idx].cpu()
                         })
                     
             
