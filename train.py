@@ -180,10 +180,6 @@ def main(cfg_path, resume):
             all_val_records = []
             l1_metric = nn.L1Loss(reduction='none')
             
-            # Load frozen VAE onto card dynamically only when evaluation metrics are compiled
-            vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
-            vae.eval()
-            
             with torch.no_grad():
                 for z_x, z_y in val_loader:
                     # perform an abbreviated reverse denoising loop step for eval verification
@@ -196,30 +192,26 @@ def main(cfg_path, resume):
                     # direct step reconstruction (removing pred noise from noisy sar => denoising step)
                     z_denoised = (z_t - pred_noise)
                     
-                    decoded_output = vae.decode(z_denoised / 0.18215).sample
+                    # decoded_output = vae.decode(z_denoised / 0.18215).sample
                     
                     # Gather individual tensors back across process boundaries safely
                     gathered_z_x, gathered_z_y, gathered_pred = accelerator.gather_for_metrics((z_x, z_y, decoded_output))
                     
-                    decoded_sar = vae.decode(gathered_z_x / 0.18215).sample
-                    decoded_gt = vae.decode(gathered_z_y / 0.18215).sample
+                    # decoded_sar = vae.decode(gathered_z_x / 0.18215).sample
+                    # decoded_gt = vae.decode(gathered_z_y / 0.18215).sample
                     
                     # directly compute l1 pixel loss [netween generated eo (decoded o/p) and eo]
-                    batch_l1 = l1_metric(gathered_pred, decoded_gt).mean(dim = [1, 2, 3])
+                    batch_l1 = l1_metric(gathered_pred, gathered_z_y).mean(dim = [1, 2, 3])
                 
                     for idx in range(gathered_z_x.shape[0]):
                         all_val_records.append({
                             'loss': batch_l1[idx].item(),
-                            'sar': decoded_sar[idx].cpu(),
+                            'sar': gathered_z_x[idx].cpu(),
                             'pred': gathered_pred[idx].cpu(),
-                            'gt': decoded_gt[idx].cpu()
+                            'gt': gathered_z_y[idx].cpu()
                         })
                     
-                    
-            del vae
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
+            
             if accelerator.is_main_process:
                 all_val_records.sort(key = lambda item : item['loss'])
                 best_5_samples = all_val_records[:5]    
@@ -227,8 +219,35 @@ def main(cfg_path, resume):
                  
                 mean_val_l1 = np.mean([item['loss'] for item in all_val_records])
                 
+                # ───► ONLY LOAD VAE ONCE HERE TO PLOT THE 10 EXTREME IMAGES ◄───
+                vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
+                vae.eval()
+                
+                def decode_records(records_list):
+                    decoded_samples = []
+                    for item in records_list:
+                        # Add batch axis, push to device, decode to pixels, and strip batch axis
+                        z_sar = item['sar_lat'].unsqueeze(0).to(device)
+                        z_pred = item['pred_lat'].unsqueeze(0).to(device)
+                        z_gt = item['gt_lat'].unsqueeze(0).to(device)
+                        
+                        decoded_samples.append({
+                            'loss': item['loss'],
+                            'sar': vae.decode(z_sar / 0.18215).sample.squeeze(0).cpu(),
+                            'pred': vae.decode(z_pred / 0.18215).sample.squeeze(0).cpu(),
+                            'gt': vae.decode(z_gt / 0.18215).sample.squeeze(0).cpu()
+                        })
+                    return decoded_samples
+
+                best_5_samples = decode_records(best_5_samples)
+                worst_5_samples = decode_records(worst_5_samples)
+                
                 plot_performance(best_5_samples, log_dir, tier_name=f"best_epoch_{epoch}")
                 plot_performance(worst_5_samples, log_dir, tier_name=f"worst_epoch_{epoch}")
+                
+                del vae
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
             
         if accelerator.is_main_process:    
