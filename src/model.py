@@ -195,6 +195,7 @@ import torch
 import torch.nn as nn
 from typing import Tuple
 from diffusers import UNet2DConditionModel
+from diffusers.models.attention_processor import AttnProcessor2_0
 
 class CDiffSETPretrainedUNet(nn.Module):
     """
@@ -213,7 +214,7 @@ class CDiffSETPretrainedUNet(nn.Module):
         )
         
         # Force the U-Net to use fast native Scaled Dot-Product Attention (native pytorch)
-        self.unet.set_attn_processor(processor = None)
+        self.unet.set_attn_processor(AttnProcessor2_0())
         
         self.unet.to(memory_format = torch.channels_last)
         
