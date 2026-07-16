@@ -58,9 +58,10 @@ def main(cfg_path):
             # unpack batch instances and save them individually to disk
             for idx in range(sar.shape[0]):
                 # Reconstruct the absolute dataset index across distributed worker spaces
-                # accelerator.num_processes tells us how many GPUs are running (2)
-                # accelerator.process_index tells us if this is GPU 0 or GPU 1
-                data_index = (batch_idx * 64 * accelerator.num_processes) + (idx * accelerator.num_processes) + accelerator.process_index
+                # batch_size : 16
+                
+                # data_index = (batch_idx * cfg["train"]["batch_size"] * accelerator.num_processes) + (idx * accelerator.num_processes) + accelerator.process_index
+                data_index = (batch_idx * cfg["train"]["batch_size"] + idx) * accelerator.num_processes + accelerator.process_index
                 
                 # Boundary check safety verification handling for final batch remainder tails
                 if data_index >= len(dataset):

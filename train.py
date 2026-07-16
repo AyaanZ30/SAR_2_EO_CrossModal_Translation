@@ -201,43 +201,49 @@ def main(cfg_path, resume):
             
         if epoch % 10 == 0 or epoch == total_epochs:
             model.eval()
-            all_val_records = []
             l1_metric = nn.L1Loss(reduction='none')
+            eval_timesteps = [50, 250, 500, 750]
+            
+            all_val_records = {t : [] for t in eval_timesteps}   # dict of lists (eval values for each ts)
             
             with torch.no_grad():
                 for z_x, z_y in val_loader:
-                    # perform an abbreviated reverse denoising loop step for eval verification
-                    noise = torch.randn_like(z_y)    
-                    eval_t = torch.full((z_x.shape[0],), 50, device = device).long()
-                    
-                    z_y_noisy = noise_scheduler.add_noise(z_y, noise, eval_t)
-                    
-                    noisy_input = torch.concat([z_x, z_y_noisy], dim = 1)
-                    pred_noise, _ = model(noisy_input, eval_t)
-            
-                    # Gather individual tensors back across process boundaries safely
-                    gathered_z_x, gathered_z_y, gathered_pred_noise, gathered_noise = accelerator.gather_for_metrics(
-                        (z_x, z_y, pred_noise, noise)
-                    )
-                    
-                    # directly compute l1 pixel loss [netween generated eo (decoded o/p) and eo]
-                    batch_l1 = l1_metric(gathered_pred_noise, gathered_noise).mean(dim = [1, 2, 3])
+                    for t_val in eval_timesteps:
+                        # perform an abbreviated reverse denoising loop step for eval verification
+                        noise = torch.randn_like(z_y)    
+                        eval_t = torch.full((z_x.shape[0],), t_val, device = device).long()
+                        
+                        z_y_noisy = noise_scheduler.add_noise(z_y, noise, eval_t)
+                        
+                        noisy_input = torch.concat([z_x, z_y_noisy], dim = 1)
+                        pred_noise, _ = model(noisy_input, eval_t)
                 
-                    for idx in range(gathered_z_x.shape[0]):
-                        all_val_records.append({
-                            'loss': batch_l1[idx].item(),
-                            'sar_lat': gathered_z_x[idx].cpu(),
-                            'gt_lat': gathered_z_y[idx].cpu()
-                        })
+                        # Gather individual tensors back across process boundaries safely
+                        gathered_z_x, gathered_z_y, gathered_pred_noise, gathered_noise = accelerator.gather_for_metrics(
+                            (z_x, z_y, pred_noise, noise)
+                        )
+                        
+                        # directly compute l1 pixel loss [netween generated eo (decoded o/p) and eo]
+                        batch_l1 = l1_metric(gathered_pred_noise, gathered_noise).mean(dim = [1, 2, 3])
+                    
+                        for idx in range(gathered_z_x.shape[0]):
+                            all_val_records[t_val].append({
+                                'loss': batch_l1[idx].item(),
+                                'sar_lat': gathered_z_x[idx].cpu(),
+                                'gt_lat': gathered_z_y[idx].cpu()
+                            })
                     
             
             if accelerator.is_main_process:
-                all_val_records.sort(key = lambda item : item['loss'])
-                best_5_samples = all_val_records[:5]    
-                worst_5_samples = all_val_records[-5:]   
-                 
-                mean_val_l1 = np.mean([item['loss'] for item in all_val_records])
+                mean_val_l1_per_t = {t : np.mean([r['loss'] for r in recs]) for t, recs in all_val_records.items()}
+                mean_val_l1 = np.mean(list(mean_val_l1_per_t.values()))
                 
+                # pick t=500 — the harder, more informative regime for best/worst plots
+                plot_records = all_val_records[500] 
+                plot_records.sort(key = lambda item : item['loss'])
+                best_5_samples = plot_records[:5]
+                worst_5_samples = plot_records[-5:] 
+                                
                 def decode_records(records_list):
                     decoded_samples = []
                     unwrapped_model = accelerator.unwrap_model(model)
@@ -245,7 +251,6 @@ def main(cfg_path, resume):
                     
                     for item in records_list:
                         # Add batch axis, push to device, decode to pixels, and strip batch axis
-                        # z_sar = item['sar_lat'].unsqueeze(0).to("cpu")
                         z_sar = item['sar_lat'].unsqueeze(0).to(device)
                         z_gt = item['gt_lat'].unsqueeze(0).to("cpu")
                         
