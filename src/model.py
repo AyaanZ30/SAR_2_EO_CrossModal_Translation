@@ -212,6 +212,11 @@ class CDiffSETPretrainedUNet(nn.Module):
             torch_dtype=torch.float32 
         )
         
+        # Force the U-Net to use fast native Scaled Dot-Product Attention (native pytorch)
+        self.unet.set_attn_processor(processor = None)
+        
+        self.unet.to(memory_format = torch.channels_last)
+        
         # 2. Modify the first layer to accept 8 channels (4 SAR latents + 4 Noisy EO latents)
         # We extract the pretrained weights to preserve what the model already knows about image structures
         old_weights = self.unet.conv_in.weight.data # Shape: [320, 4, 3, 3]
@@ -253,6 +258,7 @@ class CDiffSETPretrainedUNet(nn.Module):
             concatenated_latent: (B, 8, 32, 32) tensor representing [SAR, Noisy_EO]
             timesteps: (B,) current diffusion timesteps
         """
+        concatenated_latent = concatenated_latent.to(memory_format = torch.channels_last)
         # Stable Diffusion expects text embeddings for its cross-attention layers.
         # Since we aren't using text, we pass a dummy empty embedding tensor to satisfy the input format.
         batch_size = concatenated_latent.shape[0]

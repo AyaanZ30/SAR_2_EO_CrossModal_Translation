@@ -522,7 +522,7 @@ def main(cfg_path, resume):
             
             train_losses.append(loss.item())
             
-        if epoch % 10 == 0 or epoch == total_epochs:
+        if epoch % 2 == 0 or epoch == total_epochs:
             model.eval()
             l1_metric = nn.L1Loss(reduction='none')
             eval_timesteps = [50, 250, 500, 750]
