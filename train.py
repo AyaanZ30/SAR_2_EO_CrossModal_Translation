@@ -191,8 +191,13 @@ def main(cfg_path, resume):
             pred_noise, confidence = model(u_net_input, timesteps) 
             
             noise_residual = torch.square(noise - pred_noise)
-            loss_map = noise_residual * confidence - torch.log(confidence + 1e-6) #
-            loss = loss_map.mean()
+            
+            # loss_map = noise_residual * confidence - torch.log(confidence + 1e-6) 
+            # loss = loss_map.mean()
+            
+            # ===========================================
+            loss = torch.square(noise - pred_noise).mean()
+            # ===========================================
             
             accelerator.backward(loss)
             optimizer.step()
