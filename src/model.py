@@ -205,7 +205,6 @@ class CDiffSETPretrainedUNet(nn.Module):
         super().__init__()
         self.latent_channels = latent_channels
         
-        print("📥 Loading Pretrained Stable Diffusion U-Net Trunk...")
         # 1. Load the SOTA foundational U-Net architecture
         self.unet = UNet2DConditionModel.from_pretrained(
             "runwayml/stable-diffusion-v1-5", 
@@ -236,7 +235,7 @@ class CDiffSETPretrainedUNet(nn.Module):
         # Out channels matching the final block out size (320 channels)
         final_out_channels = self.unet.config.block_out_channels[0] 
         self.confidence_head = nn.Sequential(
-            nn.Conv2d(final_out_channels, base_channels, kernel_size=3, padding=1),
+            nn.Conv2d(latent_channels, base_channels, kernel_size=3, padding=1),
             nn.SiLU(),
             nn.Conv2d(base_channels, 1, kernel_size=3, padding=1),
             nn.Sigmoid()
@@ -275,10 +274,7 @@ class CDiffSETPretrainedUNet(nn.Module):
         # We drive it through our custom head to track pixel alignments
         pred_noise = unet_output
         
-        # Re-route the final internal upsample state for the confidence matrix calculation
-        # Using the base features layout map
-        with torch.set_grad_enabled(True):
-            confidence = self.confidence_head(self.unet.conv_out(unet_output))
+        confidence = self.confidence_head(unet_output)
             
         return pred_noise, confidence
 
