@@ -209,7 +209,7 @@ class CDiffSETPretrainedUNet(nn.Module):
         self.unet = UNet2DConditionModel.from_pretrained(
             "runwayml/stable-diffusion-v1-5", 
             subfolder="unet",
-            torch_dtype=torch.float16 # Enforce fp16 memory savings immediately
+            torch_dtype=torch.float32 
         )
         
         # 2. Modify the first layer to accept 8 channels (4 SAR latents + 4 Noisy EO latents)
