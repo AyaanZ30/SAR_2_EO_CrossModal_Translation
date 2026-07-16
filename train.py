@@ -196,7 +196,7 @@ def main(cfg_path, resume):
             # loss = loss_map.mean()
             
             # ===========================================
-            loss = torch.square(noise - pred_noise).mean()
+            loss = torch.square(noise - pred_noise).mean() + 0.0 * confidence.mean()
             # ===========================================
             
             accelerator.backward(loss)
