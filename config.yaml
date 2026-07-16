@@ -16,7 +16,7 @@ train:
   epochs: 50               # see note below on sizing this against your real per-epoch time and the 12hr session cap
   lr: 0.0004
   num_workers: 4           # Kaggle notebooks typically expose 2-4 CPU cores; 2 is a safe default, raise if no bottleneck
-  # vae_output_dir : "/tmp/latent_vecs"
-  vae_output_dir : "/kaggle/working/latent_vecs"
+  vae_output_dir : "/tmp/latent_vecs"
+  # vae_output_dir : "/kaggle/working/latent_vecs"
   checkpoint_dir: "/kaggle/working/outputs/checkpoints"
   log_dir: "/kaggle/working/outputs"
