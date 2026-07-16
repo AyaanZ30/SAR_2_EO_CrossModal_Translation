@@ -120,7 +120,7 @@ class SpatialCrossAttention(nn.Module):
         attn_weights = F.softmax(attn, dim = -1)
         
         # Apply weights to value maps
-        out = torch.bmm(attn_weights * v)
+        out = torch.bmm(attn_weights, v)
         out = out.transpose(1, 2).view(B, C, H, W)
         
         return x + self.out_proj(out)
