@@ -94,37 +94,6 @@ class CDiffUpBlock(nn.Module):
         x_skip = self.conv(x_skip)
         t_spatial = self.time_mlp(time_emb).unsqueeze(-1).unsqueeze(-1)
         return (x_skip + t_spatial)
-
-class SpatialCrossAttention(nn.Module):
-    def __init__(self, channels : int):
-        super().__init__()
-        self.channels = channels 
-        
-        self.q_proj = nn.Conv2d(channels, channels, kernel_size = 1)
-        self.k_proj = nn.Conv2d(channels, channels, kernel_size = 1)
-        self.v_proj = nn.Conv2d(channels, channels, kernel_size = 1)
-        
-        self.out_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.scale = 1.0 / (channels ** 0.5)
-    
-    def forward(self, x : torch.Tensor, context : torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        
-        # (B, C, H, W) => (B, C, H*W)[flatten] => (B, H*W, C) [transpose]
-        q = self.q_proj(x).flatten(2).transpose(1, 2)
-        k = self.k_proj(context).flatten(2)            # (B, C, H*W)
-        v = self.v_proj(context).flatten(2).transpose(1, 2)
-        
-        # gives attention score for each pixel ((H*W, C) * (C, H*W)) (cross attention matrix)
-        attn = torch.bmm(q, k) * self.scale    # attention formula 
-        attn_weights = F.softmax(attn, dim = -1)
-        
-        # Apply weights to value maps
-        out = torch.bmm(attn_weights, v)
-        out = out.transpose(1, 2).view(B, C, H, W)
-        
-        return x + self.out_proj(out)
-    
     
 
 class CDiffSETUNet(nn.Module):
@@ -153,16 +122,6 @@ class CDiffSETUNet(nn.Module):
         self.down1 = CDiffDownBlock(base_channels, base_channels * 2, time_dim)
         self.down2 = CDiffDownBlock(base_channels * 2, base_channels * 4, time_dim)
         self.down3 = CDiffDownBlock(base_channels * 4, base_channels * 8, time_dim)
-        
-        # ───► ADD THIS: Isolated Downsampling Lane for Pure SAR Geometry ◄───
-        # This matches the structural shapes exactly without mixing target noise
-        self.sar_in = nn.Conv2d(latent_channels, base_channels, kernel_size=3, padding=1)
-        self.sar_down1 = nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, stride=2, padding=1)
-        self.sar_down2 = nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=3, stride=2, padding=1)
-        self.sar_down3 = nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size=3, stride=2, padding=1)
-        
-        # ───► ADD THIS: Cross-Attention Core Block at the Bottom ◄───
-        self.cross_attn = SpatialCrossAttention(channels=base_channels * 8)
         
         self.bottleneck = nn.Sequential(
             nn.Conv2d(base_channels * 8, base_channels * 8, kernel_size = 3, padding = 1),
@@ -194,24 +153,12 @@ class CDiffSETUNet(nn.Module):
     def forward(self, concatenated_latent : torch.Tensor, timesteps : torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         t_emb = self.time_embed(timesteps)
         
-        sar_latent = concatenated_latent[:, :self.latent_channels, :, :]
-        
-        # extract pure, noise-free spatial geometries from SAR (for cross attn mod)
-        s = F.silu(self.sar_in(sar_latent))
-        s = F.silu(self.sar_down1(s))
-        s = F.silu(self.sar_down2(s))
-        sar_context = F.silu(self.sar_down3(s)) # Shapes: [B, 512, 4, 4]
-        
         x1 = self.in_conv(concatenated_latent)
         x2 = self.down1(x1, t_emb)
         x3 = self.down2(x2, t_emb)
         x4 = self.down3(x3, t_emb)
         
-        # INJECT SPATIAL CROSS-ATTENTION AT THE BOTTLENECK 
-        # q <= noise-mized features & k/v <= clean SAR context
-        x4_attended = self.cross_attn(x4, sar_context)
-        
-        mid = self.bottleneck(x4_attended)
+        mid = self.bottleneck(x4)
         
         u3 = self.up3(mid, x3, t_emb)
         u2 = self.up2(u3, x2, t_emb)
