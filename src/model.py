@@ -94,6 +94,40 @@ class CDiffUpBlock(nn.Module):
         x_skip = self.conv(x_skip)
         t_spatial = self.time_mlp(time_emb).unsqueeze(-1).unsqueeze(-1)
         return (x_skip + t_spatial)
+
+class SelfAttention2D(nn.Module):
+    """
+    Standard multi-head self-attention over spatial positions, applied at
+    low-resolution feature maps where the token count (H*W) is small.
+    """
+    def __init__(self, channels : int, num_heads : int):
+        super().__init__()
+        self.channels = channels 
+        self.num_heads = num_heads
+        self.norm = nn.GroupNorm(8, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size = 1)    # skeleton of q, k, v
+        self.proj = nn.Conv2d(channels, channels, kernel_size = 1)       # output proj layer
+    
+    def forward(self, x : torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape  
+        residual = x
+
+        x = self.norm(x)
+        qkv = self.qkv(x)                     # (B, 3C, H, W)
+        q, k, v = qkv.chunk(3, dim = 1)       # split into q, k, v
+
+        head_dim = C // self.num_heads
+        def reshape_heads(t):
+            return t.view(B, self.num_heads, head_dim, H*W).transpose(2, 3)
+
+        q, k, v = reshape_heads(q), reshape_heads(k), reshape_heads(v)
+        
+        attn = torch.softmax((q @ k.transpose(-2, -1)) / (head_dim ** 0.5), dim = 1)
+        out = attn @ v     # (B, num_heads, H*W, head_dim)
+        out = out.transpose(2, 3).contiguous().view(B, C, H, W)
+        out = self.proj(out)
+
+        return (residual + out)
     
 
 class CDiffSETUNet(nn.Module):
@@ -128,6 +162,9 @@ class CDiffSETUNet(nn.Module):
             nn.GroupNorm(8, base_channels * 8),
             nn.SiLU()
         )
+        self.bottleneck_attn = SelfAttention2D(base_channels * 8, num_heads = 8)
+
+        self.mid_attn = SelfAttention2D(base_channels * 8, num_heads=8)  # after down3, before bottleneck
         
         self.up3 = CDiffUpBlock(base_channels * 8, base_channels * 4, time_dim)
         self.up2 = CDiffUpBlock(base_channels * 4, base_channels * 2, time_dim)
@@ -157,8 +194,12 @@ class CDiffSETUNet(nn.Module):
         x2 = self.down1(x1, t_emb)
         x3 = self.down2(x2, t_emb)
         x4 = self.down3(x3, t_emb)
+
+        x4 = self.mid_attn(x4)         # new
         
         mid = self.bottleneck(x4)
+
+        mid = self.bottleneck_attn(mid)    # new
         
         u3 = self.up3(mid, x3, t_emb)
         u2 = self.up2(u3, x2, t_emb)
