@@ -107,7 +107,10 @@ class SelfAttention2D(nn.Module):
         self.norm = nn.GroupNorm(8, channels)
         self.qkv = nn.Conv2d(channels, channels * 3, kernel_size = 1)    # skeleton of q, k, v
         self.proj = nn.Conv2d(channels, channels, kernel_size = 1)       # output proj layer
-    
+
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
     def forward(self, x : torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape  
         residual = x
@@ -122,7 +125,7 @@ class SelfAttention2D(nn.Module):
 
         q, k, v = reshape_heads(q), reshape_heads(k), reshape_heads(v)
         
-        attn = torch.softmax((q @ k.transpose(-2, -1)) / (head_dim ** 0.5), dim = 1)
+        attn = torch.softmax((q @ k.transpose(-2, -1)) / (head_dim ** 0.5), dim = -1)
         out = attn @ v     # (B, num_heads, H*W, head_dim)
         out = out.transpose(2, 3).contiguous().view(B, C, H, W)
         out = self.proj(out)
