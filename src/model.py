@@ -121,29 +121,34 @@ class CDiffUpBlock(nn.Module):
             x_skip = block(x_skip, time_emb)
         return x_skip
 
-class SelfAttention2D(nn.Module):
+class CrossAttention2D(nn.Module):
     """
-    Standard multi-head self-attention over spatial positions, applied at
-    low-resolution feature maps where the token count (H*W) is small.
+    Cross-Attention layer where Queries come from the noisy EO latents (x),
+    and Keys/Values come from the structural SAR condition (context).
     """
     def __init__(self, channels : int, num_heads : int):
         super().__init__()
         self.channels = channels 
         self.num_heads = num_heads
-        self.norm = nn.GroupNorm(8, channels)
-        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size = 1)    # skeleton of q, k, v
-        self.proj = nn.Conv2d(channels, channels, kernel_size = 1)       # output proj layer
+        self.norm_x = nn.GroupNorm(8, channels)
+        self.norm_context = nn.GroupNorm(8, channels)
 
+        self.q_proj = nn.Conv2d(channels, channels, kernel_size = 1)
+        self.k_proj = nn.Conv2d(channels, channels, kernel_size = 1)
+        self.v_proj = nn.Conv2d(channels, channels, kernel_size = 1)
+        self.proj = nn.Conv2d(channels, channels, kernel_size = 1)
+        
         nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
 
-    def forward(self, x : torch.Tensor) -> torch.Tensor:
+    def forward(self, x : torch.Tensor, context : torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape  
         residual = x
 
-        x = self.norm(x)
-        qkv = self.qkv(x)                     # (B, 3C, H, W)
-        q, k, v = qkv.chunk(3, dim = 1)       # split into q, k, v
+        # standardize and proj features [each (B, C, H, W)]
+        q = self.q_proj(self.norm_x(x))
+        k = self.k_proj(self.norm_context(context))
+        v = self.v_proj(self.norm_context(context))
 
         head_dim = C // self.num_heads
         def reshape_heads(t):
@@ -151,12 +156,13 @@ class SelfAttention2D(nn.Module):
 
         q, k, v = reshape_heads(q), reshape_heads(k), reshape_heads(v)
         
+        # Compute Attention map: EO Queries look up SAR Keys
         attn = torch.softmax((q @ k.transpose(-2, -1)) / (head_dim ** 0.5), dim = -1)
         out = attn @ v     # (B, num_heads, H*W, head_dim)
         out = out.transpose(2, 3).contiguous().view(B, C, H, W)
         out = self.proj(out)
 
-        return (residual + out)
+        return residual + out
     
 
 class CDiffSETUNet(nn.Module):
@@ -182,55 +188,79 @@ class CDiffSETUNet(nn.Module):
         self.time_embed = TimeEmbedding(embedding_dim = time_dim)
         
         # Input Layer (Accepts concatenated SAR latent + noisy EO latent)
-        self.in_conv = nn.Conv2d(latent_channels * 2, base_channels, kernel_size=3, padding=1)
+        # self.in_conv = nn.Conv2d(latent_channels * 2, base_channels, kernel_size=3, padding=1)
+
+        # Input layer (accepts only noisy EO latents)
+        self.in_conv = nn.Conv2d(latent_channels, base_channels, kernel_size=3, padding=1)
 
         self.down1 = CDiffDownBlock(base_channels, base_channels * 2, time_dim, num_residual_blocks)
         self.down2 = CDiffDownBlock(base_channels * 2, base_channels * 4, time_dim, num_residual_blocks)
         self.down3 = CDiffDownBlock(base_channels * 4, base_channels * 8, time_dim, num_residual_blocks)
         
+        # since we removed concatenation of SAR to noisy EO (in_conv) => create a sep sar encoder
+         # Matches spatial downsampling factor of main path (1/8 resolution)
+        self.sar_encoder = nn.Sequential(
+            nn.Conv2d(latent_channels, base_channels * 2, kernel_size = 3, stride = 2, padding = 1),
+            nn.SiLU(),
+            nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size = 3, stride = 2, padding = 1),
+            nn.SiLU(),
+            nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size = 3, stride = 2, padding = 1),
+            nn.GroupNorm(8, base_channels * 8),
+            nn.SiLU(),
+        )
+        
+        self.mid_cross_attn = CrossAttention2D(base_channels * 8, num_heads = 8)
         self.bottleneck = nn.Sequential(
             nn.Conv2d(base_channels * 8, base_channels * 8, kernel_size = 3, padding = 1),
             nn.GroupNorm(8, base_channels * 8),
             nn.SiLU()
         )
-        self.bottleneck_attn = SelfAttention2D(base_channels * 8, num_heads = 8)
-
-        self.mid_attn = SelfAttention2D(base_channels * 8, num_heads=8)  # after down3, before bottleneck
+        self.bottleneck_cross_attn = CrossAttention2D(base_channels * 8, num_heads = 8) 
         
         self.up3 = CDiffUpBlock(base_channels * 8, base_channels * 4, time_dim, num_residual_blocks)
         self.up2 = CDiffUpBlock(base_channels * 4, base_channels * 2, time_dim, num_residual_blocks)
         self.up1 = CDiffUpBlock(base_channels * 2, base_channels, time_dim, num_residual_blocks)
         
+        # gives (4 x 4 x 32 x 32) noise preds (each pixel of 32 x 32 EO images across all 3 channels)
+        self.noise_head = nn.Conv2d(base_channels, latent_channels, kernel_size = 3, padding = 1)
         
         # gives (4 x 1 x 32 x 32) confidence values (4 SAR images in a batch => 1 channel per image) => pixel level conf scores
         self.confidence_head = nn.Sequential(
-            nn.Conv2d(base_channels, base_channels, kernel_size = 3, padding = 1),
-            nn.SiLU(),
-            nn.Conv2d(base_channels, 1, kernel_size=3, padding=1),
-            # nn.Softplus()
-            nn.Sigmoid()
+            nn.Conv2d(base_channels, 1, kernel_size = 3, padding = 1),
+            # nn.Sigmoid()
+            nn.Softplus()
         )
         
         # gives (4 x 4 x 32 x 32) noise preds (each pixel of 32 x 32 EO images across all 3 channels)
-        self.noise_head = nn.Sequential(
-            nn.Conv2d(base_channels, base_channels, kernel_size = 3, padding = 1),
-            nn.SiLU(),
-            nn.Conv2d(base_channels, latent_channels, kernel_size = 3, padding = 1),
-        )
+        # self.noise_head = nn.Sequential(
+        #     nn.Conv2d(base_channels, base_channels, kernel_size = 3, padding = 1),
+        #     nn.SiLU(),
+        #     nn.Conv2d(base_channels, latent_channels, kernel_size = 3, padding = 1),
+        # )
     
-    def forward(self, concatenated_latent : torch.Tensor, timesteps : torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # def forward(self, concatenated_latent : torch.Tensor, timesteps : torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, eo_latent : torch.Tensor, sar_latent : torch.Tensor, timesteps : torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Inputs:
+            eo_latent:  (B, latent_channels, H, W)  -> Noisy EO Representation
+            sar_latent: (B, latent_channels, H, W)  -> Clear SAR Structural Conditioning Map
+            timesteps:  (B,) 
+        """
         t_emb = self.time_embed(timesteps)
         
-        x1 = self.in_conv(concatenated_latent)
+        # x1 = self.in_conv(concatenated_latent)
+        x1 = self.in_conv(eo_latent)
         x2 = self.down1(x1, t_emb)
         x3 = self.down2(x2, t_emb)
         x4 = self.down3(x3, t_emb)
 
-        x4 = self.mid_attn(x4)         # new
+        sar_features = self.sar_encoder(sar_latent)      # (B, base_channels * 8, H/8, W/8)
+
+        x4 = self.mid_cross_attn(x4, context = sar_features)         
         
         mid = self.bottleneck(x4)
 
-        mid = self.bottleneck_attn(mid)    # new
+        mid = self.bottleneck_cross_attn(mid, context = sar_features)    
         
         u3 = self.up3(mid, x3, t_emb)
         u2 = self.up2(u3, x2, t_emb)

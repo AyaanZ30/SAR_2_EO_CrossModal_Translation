@@ -92,14 +92,14 @@ def plot_performance(extreme_samples, output_dir, tier_name = "best"):
 def sample(model, scheduler, z_sar, device, num_inference_steps = 50):
     """Iterative DDPM reverse sampling conditioned on a SAR latent (more sophisticated than subtraction of noise)"""
     z_sar = z_sar.to(device)
+
     sched = DDPMScheduler(num_train_timesteps = scheduler.config.num_train_timesteps)
     sched.set_timesteps(num_inference_steps, device=device)
     
     z_t = torch.randn_like(z_sar, device = device)
     for t in sched.timesteps:
-        model_input = torch.cat([z_sar, z_t], dim = 1)
         t_batch = torch.full((z_sar.shape[0],), t, device=device, dtype=torch.long)
-        pred_noise, _ = model(model_input, t_batch)
+        pred_noise, _ = model(eo_latent = z_t, sar_latent = z_sar, timesteps = t_batch)
         z_t = sched.step(pred_noise, t, z_t).prev_sample
     return z_t 
 
@@ -176,24 +176,29 @@ def main(cfg_path, resume):
         train_losses = []
  
         for z_x, z_y in train_loader:
-            # z_x (sar latent vector) & z_y (eo latent vec) precomputed and directly loaded from memory
-             
+            # z_x: SAR latent vector, z_y: EO latent vector
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (z_x.shape[0],), device = device).long()
             noise = torch.randn_like(z_y)
             
             z_y_noisy = noise_scheduler.add_noise(z_y, noise, timesteps)
             
-            # combined input : Shape: (B, 4*2, 32, 32)
-            u_net_input = torch.cat([z_x, z_y_noisy], dim = 1)
-            
             optimizer.zero_grad()
-            # Forward pass implicitly maps mixed-precision configurations
-            pred_noise, confidence = model(u_net_input, timesteps) 
+
+            # u_net_input = torch.cat([z_x, z_y_noisy], dim = 1) (Forward pass implicitly maps mixed-precision configurations)
+            pred_noise, confidence = model(z_y_noisy, z_x, timesteps) 
             
             noise_residual = torch.square(noise - pred_noise)
-            
             loss_map = noise_residual * confidence - torch.log(confidence + 1e-6) 
-            loss = loss_map.mean()
+            base_diffusion_loss = loss_map.mean()
+
+            dy_true = torch.abs(noise[:, :, 1:, :] - noise[:, :, :-1, :])
+            dx_true = torch.abs(noise[:, :, :, 1:] - noise[:, :, :, :-1])
+            dy_pred = torch.abs(pred_noise[:, :, 1:, :] - pred_noise[:, :, :-1, :])
+            dx_pred = torch.abs(pred_noise[:, :, :, 1:] - pred_noise[:, :, :, :-1])
+            
+            latent_structural_loss = nn.functional.l1_loss(dy_pred, dy_true) + nn.functional.l1_loss(dx_pred, dx_true)
+
+            loss = base_diffusion_loss + (0.2 * latent_structural_loss)
             
             accelerator.backward(loss)
             optimizer.step()
@@ -216,8 +221,7 @@ def main(cfg_path, resume):
                         
                         z_y_noisy = noise_scheduler.add_noise(z_y, noise, eval_t)
                         
-                        noisy_input = torch.concat([z_x, z_y_noisy], dim = 1)
-                        pred_noise, _ = model(noisy_input, eval_t)
+                        pred_noise, _ = model(z_y_noisy, z_x, eval_t)
                 
                         # Gather individual tensors back across process boundaries safely
                         gathered_z_x, gathered_z_y, gathered_pred_noise, gathered_noise = accelerator.gather_for_metrics(
