@@ -36,36 +36,61 @@ class TimeEmbedding(nn.Module):
         
         return self.mlp(embeddings)
 
+class ResidualBlock2D(nn.Module):
+    """
+    Refines features at the same spatial resolution while 
+    deeply integrating time embeddings over multiple convolutions.
+    """
+    def __init__(self, channels : int, time_emb_dim : int):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            nn.GroupNorm(num_groups=8, num_channels=channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        )
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(in_features=time_emb_dim, out_features=channels)
+        )
+        self.conv2 = nn.Sequential(
+            nn.GroupNorm(num_groups=8, num_channels=channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        )
+    
+    def forward(self, x : torch.Tensor, time_emb : torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.conv1(x)
+
+        t_spatial = self.time_mlp(time_emb).unsqueeze(-1).unsqueeze(-1)
+        x = x + t_spatial
+
+        x = self.conv2(x)
+        return residual + x
+
 class CDiffDownBlock(nn.Module):
     """
     Downsampling block for C-DiffSET U-Net. Integrates spatial feature maps 
     with sinusoidal time embeddings.
     """
-    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int):
+    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int, num_res_blocks : int = 3):
         super().__init__() 
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(num_groups = 8, num_channels = out_channels),
             nn.SiLU()
         )
-        self.time_mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(in_features = time_emb_dim, out_features = out_channels)
-        )
         
         # to deeply integrate the time information with spatial SAR/EO features (no shape shrinking just blending)
-        self.residual_conv = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups = 8, num_channels = out_channels),
-            nn.SiLU()
-        )
+        self.res_blocks = nn.ModuleList([
+            ResidualBlock2D(out_channels, time_emb_dim) for _ in range(num_res_blocks)
+        ])
     
     def forward(self, x : torch.Tensor, time_emb : torch.Tensor) -> torch.Tensor:
         x = self.conv(x)
-        
-        # Inject time embedding contextually across channels
-        t_spatial = self.time_mlp(time_emb).unsqueeze(-1).unsqueeze(-1)    # converts [4, 64] -> [4, 64, 1, 1] (adds 2  trailing dims [-1(last position)])
-        return self.residual_conv(x + t_spatial)
+        for block in self.res_blocks:
+            x = block(x, time_emb)
+        return x
     
 
 class CDiffUpBlock(nn.Module):
@@ -73,27 +98,28 @@ class CDiffUpBlock(nn.Module):
     Upsampling block for C-DiffSET U-Net. Merges up-projected representations 
     with structural skip connections across matching latent scales.
     """
-    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int):
+    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int, num_res_blocks: int = 3):
         super().__init__()
         self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1)
         
         # after concatenating feature maps at diff latent scales => dim increases again => conv required to shrink it to out channels size
-        self.conv = nn.Sequential(
+        self.conv_blend = nn.Sequential(
             nn.Conv2d(out_channels * 2, out_channels, kernel_size = 3, padding = 1),
             nn.GroupNorm(8, out_channels),
             nn.SiLU()    
         )
-        self.time_mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(in_features = time_emb_dim, out_features = out_channels)
-        )
+        self.res_blocks = nn.ModuleList([
+            ResidualBlock2D(out_channels, time_emb_dim) for _ in range(num_res_blocks)
+        ])
         
     def forward(self, x : torch.Tensor, skip : torch.Tensor, time_emb : torch.Tensor) -> torch.Tensor:
         x = self.up(x)
         x_skip = torch.cat([x, skip], dim = 1)
-        x_skip = self.conv(x_skip)
-        t_spatial = self.time_mlp(time_emb).unsqueeze(-1).unsqueeze(-1)
-        return (x_skip + t_spatial)
+        x_skip = self.conv_blend(x_skip)
+
+        for block in self.res_blocks:
+            x_skip = block(x_skip, time_emb)
+        return x_skip
 
 class SelfAttention2D(nn.Module):
     """
@@ -149,6 +175,8 @@ class CDiffSETUNet(nn.Module):
     def __init__(self, latent_channels : int = 4, base_channels : int = 64, time_dim: int = 256):
         super().__init__()
         self.latent_channels = latent_channels
+
+        num_residual_blocks = 3
         
         # time projection global line (used in fwd pass thru the UNet)
         self.time_embed = TimeEmbedding(embedding_dim = time_dim)
@@ -156,9 +184,9 @@ class CDiffSETUNet(nn.Module):
         # Input Layer (Accepts concatenated SAR latent + noisy EO latent)
         self.in_conv = nn.Conv2d(latent_channels * 2, base_channels, kernel_size=3, padding=1)
 
-        self.down1 = CDiffDownBlock(base_channels, base_channels * 2, time_dim)
-        self.down2 = CDiffDownBlock(base_channels * 2, base_channels * 4, time_dim)
-        self.down3 = CDiffDownBlock(base_channels * 4, base_channels * 8, time_dim)
+        self.down1 = CDiffDownBlock(base_channels, base_channels * 2, time_dim, num_residual_blocks)
+        self.down2 = CDiffDownBlock(base_channels * 2, base_channels * 4, time_dim, num_residual_blocks)
+        self.down3 = CDiffDownBlock(base_channels * 4, base_channels * 8, time_dim, num_residual_blocks)
         
         self.bottleneck = nn.Sequential(
             nn.Conv2d(base_channels * 8, base_channels * 8, kernel_size = 3, padding = 1),
@@ -169,9 +197,9 @@ class CDiffSETUNet(nn.Module):
 
         self.mid_attn = SelfAttention2D(base_channels * 8, num_heads=8)  # after down3, before bottleneck
         
-        self.up3 = CDiffUpBlock(base_channels * 8, base_channels * 4, time_dim)
-        self.up2 = CDiffUpBlock(base_channels * 4, base_channels * 2, time_dim)
-        self.up1 = CDiffUpBlock(base_channels * 2, base_channels, time_dim)
+        self.up3 = CDiffUpBlock(base_channels * 8, base_channels * 4, time_dim, num_residual_blocks)
+        self.up2 = CDiffUpBlock(base_channels * 4, base_channels * 2, time_dim, num_residual_blocks)
+        self.up1 = CDiffUpBlock(base_channels * 2, base_channels, time_dim, num_residual_blocks)
         
         
         # gives (4 x 1 x 32 x 32) confidence values (4 SAR images in a batch => 1 channel per image) => pixel level conf scores
