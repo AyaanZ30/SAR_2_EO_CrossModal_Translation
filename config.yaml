@@ -2,18 +2,18 @@ seed: 42
 
 data:
   seasons_dir: "/kaggle/input/datasets/ayaanrzaverigmailcom/data-pairs/ROIs1868_summer"  # adjust to wherever you download the season on Kaggle
-  val_frac: 0.2                                    # fraction of ROI *scenes* (not patches) held out for val
+  val_frac: 0.25                                    # fraction of ROI *scenes* (not patches) held out for val
   max_train_rois: 25 
 
 model:
   in_ch: 1
   out_ch: 3
-  base_channels: 64      # standard pix2pix capacity; comfortably fits a single T4's 16GB VRAM at this batch size
+  base_channels: 128      
   latent_channels : 4
 
 train:
   batch_size: 16          # fits on one T4 at 256x256 with base_channels=64; raise to 24-32 if you confirm headroom
-  epochs: 100               # see note below on sizing this against your real per-epoch time and the 12hr session cap
+  epochs: 30               # see note below on sizing this against your real per-epoch time and the 12hr session cap
   lr: 0.0002
   num_workers: 4           # Kaggle notebooks typically expose 2-4 CPU cores; 2 is a safe default, raise if no bottleneck
   vae_output_dir : "/tmp/latent_vecs"
