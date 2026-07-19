@@ -182,6 +182,7 @@ class CDiffSETUNet(nn.Module):
         
         # x1 = self.in_conv(concatenated_latent)
         x1 = self.in_conv(concatenated_latent)
+        
         x2 = self.down1(x1, t_emb)
         x3 = self.down2(x2, t_emb)
         x4 = self.down3(x3, t_emb)
@@ -190,8 +191,7 @@ class CDiffSETUNet(nn.Module):
         # mid = self.bottleneck_cross_attn(mid, context = sar_features)    
         
         # Main path reconstruction flow with deep scale skips
-        u4 = self.up4(mid, x4, t_emb)                # (B, 512, 4, 4)
-        u3 = self.up3(u4, x3, t_emb)                 # (B, 256, 8, 8)
+        u3 = self.up3(mid, x3, t_emb)                 # (B, 256, 8, 8)
         u2 = self.up2(u3, x2, t_emb)                 # (B, 128, 16, 16)
         u1 = self.up1(u2, x1, t_emb)                 # (B, 64, 32, 32)
         
