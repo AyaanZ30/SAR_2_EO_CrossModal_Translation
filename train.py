@@ -92,7 +92,8 @@ def sample(model, scheduler, z_sar, device, num_inference_steps = 50):
     z_t = torch.randn_like(z_sar, device = device)
     for t in sched.timesteps:
         t_batch = torch.full((z_sar.shape[0],), t, device=device, dtype=torch.long)
-        pred_noise, _ = model(eo_latent = z_t, sar_latent = z_sar, timesteps = t_batch)
+        concatenated_latent = torch.cat([z_sar, z_t], dim = 1)
+        pred_noise, _ = model(concatenated_latent, timesteps = t_batch)
         z_t = sched.step(pred_noise, t, z_t).prev_sample
     return z_t 
 
@@ -177,21 +178,12 @@ def main(cfg_path, resume):
             
             optimizer.zero_grad()
 
-            # u_net_input = torch.cat([z_x, z_y_noisy], dim = 1) (Forward pass implicitly maps mixed-precision configurations)
-            pred_noise, confidence = model(z_y_noisy, z_x, timesteps) 
+            u_net_input = torch.cat([z_x, z_y_noisy], dim = 1) 
+            pred_noise, confidence = model(u_net_input, timesteps) 
             
             noise_residual = torch.square(noise - pred_noise)
             loss_map = noise_residual * confidence - torch.log(confidence + 1e-6) 
-            base_diffusion_loss = loss_map.mean()
-
-            dy_true = torch.abs(noise[:, :, 1:, :] - noise[:, :, :-1, :])
-            dx_true = torch.abs(noise[:, :, :, 1:] - noise[:, :, :, :-1])
-            dy_pred = torch.abs(pred_noise[:, :, 1:, :] - pred_noise[:, :, :-1, :])
-            dx_pred = torch.abs(pred_noise[:, :, :, 1:] - pred_noise[:, :, :, :-1])
-            
-            latent_structural_loss = nn.functional.l1_loss(dy_pred, dy_true) + nn.functional.l1_loss(dx_pred, dx_true)
-
-            loss = base_diffusion_loss + (0.2 * latent_structural_loss)
+            loss = loss_map.mean()
             
             accelerator.backward(loss)
             optimizer.step()
@@ -201,7 +193,7 @@ def main(cfg_path, resume):
         if epoch % 10 == 0 or epoch == total_epochs:
             model.eval()
             l1_metric = nn.L1Loss(reduction='none')
-            eval_timesteps = [50, 250, 500, 750]
+            eval_timesteps = [50, 250, 500, 750, 1000]
             
             all_val_records = {t : [] for t in eval_timesteps}   # dict of lists (eval values for each ts)
             
@@ -214,7 +206,8 @@ def main(cfg_path, resume):
                         
                         z_y_noisy = noise_scheduler.add_noise(z_y, noise, eval_t)
                         
-                        pred_noise, _ = model(z_y_noisy, z_x, eval_t)
+                        combined = torch.cat([z_x, z_y_noisy], dim = 1) 
+                        pred_noise, _ = model(combined, eval_t)
                 
                         # Gather individual tensors back across process boundaries safely
                         gathered_z_x, gathered_z_y, gathered_pred_noise, gathered_noise = accelerator.gather_for_metrics(

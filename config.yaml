@@ -13,8 +13,8 @@ model:
 
 train:
   batch_size: 16          # fits on one T4 at 256x256 with base_channels=64; raise to 24-32 if you confirm headroom
-  epochs: 30               # see note below on sizing this against your real per-epoch time and the 12hr session cap
-  lr: 0.0002
+  epochs: 100               # see note below on sizing this against your real per-epoch time and the 12hr session cap
+  lr: 0.005
   num_workers: 4           # Kaggle notebooks typically expose 2-4 CPU cores; 2 is a safe default, raise if no bottleneck
   vae_output_dir : "/tmp/latent_vecs"
   # vae_output_dir : "/kaggle/working/latent_vecs"
