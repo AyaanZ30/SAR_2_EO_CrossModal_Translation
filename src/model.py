@@ -196,27 +196,30 @@ class CDiffSETUNet(nn.Module):
         self.down1 = CDiffDownBlock(base_channels, base_channels * 2, time_dim, num_residual_blocks)
         self.down2 = CDiffDownBlock(base_channels * 2, base_channels * 4, time_dim, num_residual_blocks)
         self.down3 = CDiffDownBlock(base_channels * 4, base_channels * 8, time_dim, num_residual_blocks)
+        self.down4 = CDiffDownBlock(base_channels * 8, base_channels * 16, time_dim, num_residual_blocks)    # NEW
         
-        # since we removed concatenation of SAR to noisy EO (in_conv) => create a sep sar encoder
-         # Matches spatial downsampling factor of main path (1/8 resolution)
+        # Matches spatial downsampling factor of main path (1/8 resolution)
         self.sar_encoder = nn.Sequential(
             nn.Conv2d(latent_channels, base_channels * 2, kernel_size = 3, stride = 2, padding = 1),
             nn.SiLU(),
             nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size = 3, stride = 2, padding = 1),
             nn.SiLU(),
             nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size = 3, stride = 2, padding = 1),
-            nn.GroupNorm(8, base_channels * 8),
+            nn.SiLU(),
+            nn.Conv2d(base_channels * 8, base_channels * 16, kernel_size = 3, stride = 2, padding = 1), # Added 4th step
+            nn.GroupNorm(8, base_channels * 16),
             nn.SiLU(),
         )
         
-        self.mid_cross_attn = CrossAttention2D(base_channels * 8, num_heads = 8)
+        self.mid_cross_attn = CrossAttention2D(base_channels * 16, num_heads = 8)
         self.bottleneck = nn.Sequential(
-            nn.Conv2d(base_channels * 8, base_channels * 8, kernel_size = 3, padding = 1),
-            nn.GroupNorm(8, base_channels * 8),
+            nn.Conv2d(base_channels * 16, base_channels * 16, kernel_size = 3, padding = 1),
+            nn.GroupNorm(8, base_channels * 16),
             nn.SiLU()
         )
-        self.bottleneck_cross_attn = CrossAttention2D(base_channels * 8, num_heads = 8) 
+        self.bottleneck_cross_attn = CrossAttention2D(base_channels * 16, num_heads = 8) 
         
+        self.up4 = CDiffUpBlock(base_channels * 16, base_channels * 8, time_dim, num_residual_blocks)      # NEW
         self.up3 = CDiffUpBlock(base_channels * 8, base_channels * 4, time_dim, num_residual_blocks)
         self.up2 = CDiffUpBlock(base_channels * 4, base_channels * 2, time_dim, num_residual_blocks)
         self.up1 = CDiffUpBlock(base_channels * 2, base_channels, time_dim, num_residual_blocks)
@@ -227,8 +230,7 @@ class CDiffSETUNet(nn.Module):
         # gives (4 x 1 x 32 x 32) confidence values (4 SAR images in a batch => 1 channel per image) => pixel level conf scores
         self.confidence_head = nn.Sequential(
             nn.Conv2d(base_channels, 1, kernel_size = 3, padding = 1),
-            # nn.Sigmoid()
-            nn.Softplus()
+            nn.Sigmoid()
         )
         
         # gives (4 x 4 x 32 x 32) noise preds (each pixel of 32 x 32 EO images across all 3 channels)
@@ -253,18 +255,20 @@ class CDiffSETUNet(nn.Module):
         x2 = self.down1(x1, t_emb)
         x3 = self.down2(x2, t_emb)
         x4 = self.down3(x3, t_emb)
+        x5 = self.down4(x4, t_emb)
 
+        # process cond alignment context map
         sar_features = self.sar_encoder(sar_latent)      # (B, base_channels * 8, H/8, W/8)
 
-        x4 = self.mid_cross_attn(x4, context = sar_features)         
-        
-        mid = self.bottleneck(x4)
-
+        x5 = self.mid_cross_attn(x5, context = sar_features)         
+        mid = self.bottleneck(x5)
         mid = self.bottleneck_cross_attn(mid, context = sar_features)    
         
-        u3 = self.up3(mid, x3, t_emb)
-        u2 = self.up2(u3, x2, t_emb)
-        u1 = self.up1(u2, x1, t_emb)
+        # Main path reconstruction flow with deep scale skips
+        u4 = self.up4(mid, x4, t_emb)                # (B, 512, 4, 4)
+        u3 = self.up3(u4, x3, t_emb)                 # (B, 256, 8, 8)
+        u2 = self.up2(u3, x2, t_emb)                 # (B, 128, 16, 16)
+        u1 = self.up1(u2, x1, t_emb)                 # (B, 64, 32, 32)
         
         pred_noise = self.noise_head(u1)
         confidence = self.confidence_head(u1)
@@ -273,23 +277,19 @@ class CDiffSETUNet(nn.Module):
     
 if __name__ == "__main__":
     model = CDiffSETUNet(latent_channels = 4, base_channels = 64)
-    
     batch_size = 4
     
-    print('VAE stage skipped [where (4, 3, 32, 32)(EO) & (4, 1, 32, 32)(SAR) => (4, 4, 32, 32) each]')
-    dummy_sar_latent = zy = torch.randn(batch_size, 4, 32, 32)
-    dummy_noisy_eo_latent = zx_t = torch.randn(batch_size, 4, 32, 32)
-    dummy_input = torch.cat([zy, zx_t], dim=1)
-    
+    dummy_sar_latent = torch.randn(batch_size, 4, 32, 32)
+    dummy_noisy_eo_latent = torch.randn(batch_size, 4, 32, 32)
     dummy_t = torch.randint(0, 1000, (batch_size,)).float()
     
-    eps, conf = model(dummy_input, dummy_t)
+    # FIXED: Forward pass signature decoupling matching new Cross-Attention design rules
+    eps, conf = model(dummy_noisy_eo_latent, dummy_sar_latent, dummy_t)
     
     print("--- C-DiffSET Execution Shape Targets ---")
-    print(f"Combined Inputs Shapes:    {tuple(dummy_input.shape)}")
     print(f"Predicted Noise Map Profile: {tuple(eps.shape)}")
     print(f"Generated Confidence Matrix: {tuple(conf.shape)}")
     
     assert eps.shape == dummy_sar_latent.shape, "Noise matching head target shape mismatch."
     assert conf.shape == (batch_size, 1, 32, 32), "Confidence map tracking spatial shape failure."
-    print("\n[SUCCESS] Model shapes successfully align with C-DiffSET design paradigms.")
+    print("\n[SUCCESS] Deep model scales successfully align with C-DiffSET paradigms.")
