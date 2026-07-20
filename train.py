@@ -118,11 +118,6 @@ def main(cfg_path, resume):
     noise_scheduler = DDPMScheduler(num_train_timesteps = 1000)
     model = CDiffSETUNet(latent_channels = cfg["model"]["latent_channels"], base_channels = cfg["model"]["base_channels"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]), weight_decay=1e-4)
-    
-    # ===================new====================
-    # criterion_diffusion = nn.L1Loss()
-    # criterion_spatial = SpatialGradientLoss()
-    # =========================================
 
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to("cpu")
     vae.eval()
@@ -133,6 +128,8 @@ def main(cfg_path, resume):
         model, optimizer, train_loader, val_loader
     )
     
+    image_l1_metric = nn.L1Loss()
+
     start_epoch = 1
     history = []  
     
@@ -151,6 +148,12 @@ def main(cfg_path, resume):
         epoch_start = time.perf_counter()
         
         mean_val_l1 = float('nan')
+
+        mean_img_space_l1 = float('nan')
+        epoch_raw_residuals = []
+        epoch_conf_means = []
+        epoch_conf_mins = []
+        epoch_conf_maxs = []
         
         model.train()
         train_losses = []
@@ -159,7 +162,6 @@ def main(cfg_path, resume):
             # z_x: SAR latent vector, z_y: EO latent vector
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (z_x.shape[0],), device = device).long()
             noise = torch.randn_like(z_y)
-            
             z_y_noisy = noise_scheduler.add_noise(z_y, noise, timesteps)
             
             optimizer.zero_grad()
@@ -168,6 +170,11 @@ def main(cfg_path, resume):
             pred_noise, confidence = model(u_net_input, timesteps) 
             
             noise_residual = torch.square(noise - pred_noise)
+            epoch_raw_residuals.append(noise_residual.mean().item())
+            epoch_conf_means.append(confidence.mean().item())
+            epoch_conf_mins.append(confidence.min().item())
+            epoch_conf_maxs.append(confidence.max().item())
+
             loss_map = noise_residual * confidence - torch.log(confidence + 1e-6) 
             loss = loss_map.mean()
             
@@ -182,9 +189,24 @@ def main(cfg_path, resume):
             eval_timesteps = [25, 50, 250, 500, 750, 999]
             
             all_val_records = {t : [] for t in eval_timesteps}   # dict of lists (eval values for each ts)
-            
+            val_image_l1_errors = []
+
             with torch.no_grad():
+                first_batch = True
                 for z_x, z_y in val_loader:
+                    if first_batch:
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        z_gen = sample(unwrapped_model, noise_scheduler, z_x, device, num_inference_steps=50)
+                        
+                        # Decoded image comparisons
+                        img_pred = vae.decode(z_gen / 0.18215).sample
+                        img_gt = vae.decode(z_y / 0.18215).sample
+                        
+                        img_l1 = image_l1_metric(img_pred, img_gt)
+                        gathered_img_l1 = accelerator.gather_for_metrics(img_l1)
+                        val_image_l1_errors.append(gathered_img_l1.mean().item())
+                        first_batch = False
+
                     for t_val in eval_timesteps:
                         # perform an abbreviated reverse denoising loop step for eval verification
                         noise = torch.randn_like(z_y)    
@@ -214,6 +236,7 @@ def main(cfg_path, resume):
             if accelerator.is_main_process:
                 mean_val_l1_per_t = {t : np.mean([r['loss'] for r in recs]) for t, recs in all_val_records.items()}
                 mean_val_l1 = np.mean(list(mean_val_l1_per_t.values()))
+                mean_img_space_l1 = np.mean(val_image_l1_errors)
                 
                 # pick t=500 — the harder, more informative regime for best/worst plots
                 plot_records = all_val_records[500] 
@@ -253,9 +276,18 @@ def main(cfg_path, resume):
             mean_train_loss = np.mean(train_losses)
             
             val_str = f"{mean_val_l1:.4f}" if not np.isnan(mean_val_l1) else "Skipped"
+            img_val_str = f"{mean_img_space_l1:.4f}" if not np.isnan(mean_img_space_l1) else "Skipped"
+
             print(f"Epoch {epoch:03d}/{total_epochs} | Train Loss: {mean_train_loss:.4f} | Val L1 Error: {val_str} | Time: {elapsed_time:.1f}s")
+            print(f"  ├── Train Composite Loss: {mean_train_loss:.4f} | Raw Residual Mean: {np.mean(epoch_raw_residuals):.4f}")
+            print(f"  ├── Confidence Status   -> Mean: {np.mean(epoch_conf_means):.4f} | Min: {np.min(epoch_conf_mins):.4f} | Max: {np.max(epoch_conf_maxs):.4f}")
+            print(f"  └── Eval Noise L1 (Avg): {val_str} | Image Pixel Space L1: {img_val_str}")
             
-            history.append({"epoch": epoch, "train_loss": mean_train_loss, "val_l1": mean_val_l1})
+            if epoch % 10 == 0 or epoch == total_epochs:
+                t_diagnostics = ", ".join([f"t{t}:{mean_val_l1_per_t[t]:.4f}" for t in sorted(mean_val_l1_per_t.keys())])
+                print(f"        └──► Timestep Grid Loss: {t_diagnostics}")
+                
+            history.append({"epoch": epoch, "train_loss": mean_train_loss, "val_l1": mean_val_l1_per_t.values()})
             
             # save_checkpoint(full_ckpt_path, epoch, model, optimizer, scaler, history)
             torch.save({
