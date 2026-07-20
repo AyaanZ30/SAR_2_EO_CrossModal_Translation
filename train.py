@@ -81,6 +81,7 @@ def _compute_image_space_l1(model, noise_scheduler, vae, sample_fn, z_x, z_y, de
     img_gt = vae.decode((z_y.cpu()) / 0.18215).sample
 
     img_l1 = torch.abs(img_pred - img_gt).mean()
+    img_l1 = img_l1.unsqueeze(0).to(accelerator.device)
     gathered = accelerator.gather_for_metrics(img_l1)
     return gathered.mean().item()
 
