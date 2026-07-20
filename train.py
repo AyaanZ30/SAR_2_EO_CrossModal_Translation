@@ -17,32 +17,13 @@ from accelerate import Accelerator
 from diffusers import AutoencoderKL, DDPMScheduler
  
 from src.dataset import list_roi_ids, split_roi_ids, PrecomputedLatentDataset
-from src.model import CDiffSETUNet
+from src.model import CDiffSETUNet, SpatialGradientLoss
 
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    
-def save_checkpoint(path, epoch, model, optimizer, scaler, history):
-    torch.save({
-        "epoch": epoch,
-        "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "scaler_state": scaler.state_dict(),
-        "history": history,
-    }, path)
-
-def load_checkpoint(path, model, optimizer, scaler, device):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"No training checkpoint found at {path}")
-    ckpt = torch.load(path, map_location = device)
-    model.load_state_dict(ckpt["model_state"])
-    optimizer.load_state_dict(ckpt["optimizer_state"])
-    if "scaler_state" in ckpt:
-        scaler.load_state_dict(ckpt["scaler_state"])
-    return ckpt["epoch"] + 1, ckpt["history"]
 
 def plot_performance(extreme_samples, output_dir, tier_name = "best"):
     """
@@ -138,6 +119,11 @@ def main(cfg_path, resume):
     model = CDiffSETUNet(latent_channels = cfg["model"]["latent_channels"], base_channels = cfg["model"]["base_channels"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]), weight_decay=1e-4)
     
+    # ===================new====================
+    criterion_diffusion = nn.L1Loss()
+    criterion_spatial = SpatialGradientLoss()
+    # =========================================
+
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to("cpu")
     vae.eval()
     for param in vae.parameters():
@@ -183,7 +169,11 @@ def main(cfg_path, resume):
             
             noise_residual = torch.square(noise - pred_noise)
             loss_map = noise_residual * confidence - torch.log(confidence + 1e-6) 
-            loss = loss_map.mean()
+            # loss = loss_map.mean()
+            base_loss = loss_map.mean()
+
+            edge_loss = criterion_spatial(pred_noise, noise)
+            loss = base_loss + (0.5 * edge_loss)
             
             accelerator.backward(loss)
             optimizer.step()
@@ -218,8 +208,15 @@ def main(cfg_path, resume):
                         batch_l1 = l1_metric(gathered_pred_noise, gathered_noise).mean(dim = [1, 2, 3])
                     
                         for idx in range(gathered_z_x.shape[0]):
+                            single_pred = gathered_pred_noise[idx].unsqueeze(0)
+                            single_noise = gathered_noise[idx].unsqueeze(0)
+
+                            item_edge_loss = criterion_spatial(single_pred, single_noise).item()
+                            total_eval_error = batch_l1[idx].item() + (0.5 * item_edge_loss)
+
                             all_val_records[t_val].append({
-                                'loss': batch_l1[idx].item(),
+                                # 'loss': batch_l1[idx].item(),
+                                'loss': total_eval_error,
                                 'sar_lat': gathered_z_x[idx].cpu(),
                                 'gt_lat': gathered_z_y[idx].cpu()
                             })
