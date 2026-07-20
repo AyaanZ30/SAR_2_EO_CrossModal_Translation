@@ -193,7 +193,7 @@ def main(cfg_path, resume):
         if epoch % 10 == 0 or epoch == total_epochs:
             model.eval()
             l1_metric = nn.L1Loss(reduction='none')
-            eval_timesteps = [50, 250, 500, 750, 1000]
+            eval_timesteps = [25, 50, 250, 500, 750, 999]
             
             all_val_records = {t : [] for t in eval_timesteps}   # dict of lists (eval values for each ts)
             
