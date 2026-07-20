@@ -120,8 +120,8 @@ def main(cfg_path, resume):
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]), weight_decay=1e-4)
     
     # ===================new====================
-    criterion_diffusion = nn.L1Loss()
-    criterion_spatial = SpatialGradientLoss()
+    # criterion_diffusion = nn.L1Loss()
+    # criterion_spatial = SpatialGradientLoss()
     # =========================================
 
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to("cpu")
@@ -169,11 +169,7 @@ def main(cfg_path, resume):
             
             noise_residual = torch.square(noise - pred_noise)
             loss_map = noise_residual * confidence - torch.log(confidence + 1e-6) 
-            # loss = loss_map.mean()
-            base_loss = loss_map.mean()
-
-            edge_loss = criterion_spatial(pred_noise, noise)
-            loss = base_loss + (0.5 * edge_loss)
+            loss = loss_map.mean()
             
             accelerator.backward(loss)
             optimizer.step()
@@ -208,14 +204,8 @@ def main(cfg_path, resume):
                         batch_l1 = l1_metric(gathered_pred_noise, gathered_noise).mean(dim = [1, 2, 3])
                     
                         for idx in range(gathered_z_x.shape[0]):
-                            single_pred = gathered_pred_noise[idx].unsqueeze(0)
-                            single_noise = gathered_noise[idx].unsqueeze(0)
-
-                            item_edge_loss = criterion_spatial(single_pred, single_noise).item()
-                            total_eval_error = batch_l1[idx].item() + (0.5 * item_edge_loss)
-
                             all_val_records[t_val].append({
-                                # 'loss': batch_l1[idx].item(),
+                                'loss': batch_l1[idx].item(),
                                 'loss': total_eval_error,
                                 'sar_lat': gathered_z_x[idx].cpu(),
                                 'gt_lat': gathered_z_y[idx].cpu()
