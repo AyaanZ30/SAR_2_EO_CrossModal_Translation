@@ -16,6 +16,9 @@ import matplotlib.pyplot as plt
 from accelerate import Accelerator
 from diffusers import AutoencoderKL, DDPMScheduler
  
+from utils.plots import plot_performance
+from utils.logging import log_epoch
+
 from src.dataset import list_roi_ids, split_roi_ids, PrecomputedLatentDataset
 from src.model import CDiffSETUNet, SpatialGradientLoss
 
@@ -25,42 +28,129 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def plot_performance(extreme_samples, output_dir, tier_name = "best"):
-    """
-    Plots a row matrix containing the SAR input, generated EO target, and Ground Truth EO.
-    """
-    num_samples = len(extreme_samples)
-    if num_samples == 0:
-        return
-        
-    fig, axes = plt.subplots(num_samples, 3, figsize=(10, 2 * num_samples))
-    if num_samples == 1:
-        axes = np.expand_dims(axes, axis=0)
-        
-    for idx, sample in enumerate(extreme_samples):
-        # Denormalize images from [-1, 1] to [0, 1] for visual display
-        sar = ((sample['sar'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
-        if sar.shape[-1] == 3:
-            sar = sar[:, :, 0]
-            
-        pred = ((sample['pred'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
-        gt = ((sample['gt'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
-        
-        axes[idx, 0].imshow(sar, cmap='gray')
-        axes[idx, 0].set_title(f"SAR (L1: {sample['loss']:.3f})", fontsize=8)
-        axes[idx, 0].axis('off')
-        
-        axes[idx, 1].imshow(np.clip(pred, 0, 1))
-        axes[idx, 1].set_title("Generated EO", fontsize=8)
-        axes[idx, 1].axis('off')
-        
-        axes[idx, 2].imshow(np.clip(gt, 0, 1))
-        axes[idx, 2].set_title("Ground Truth", fontsize=8)
-        axes[idx, 2].axis('off')
-        
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"performance_{tier_name}.png"), dpi=150)
-    plt.close()
+def diffusion_step(model, noise_scheduler, z_x, z_y, timesteps = None):
+    """Runs one forward pass of noise prediction + confidence, returns loss and raw components."""
+    if timesteps is None: 
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (z_x.shape[0],), device = z_x.device).long()
+    noise = torch.randn_like(z_y)
+    z_y_noisy = noise_scheduler.add_noise(z_y, noise, timesteps)
+    u_net_input = torch.cat([z_x, z_y_noisy], dim=1)
+    pred_noise, confidence = model(u_net_input, timesteps)
+
+    noise_residual = torch.square(noise - pred_noise)
+    loss_map = noise_residual * confidence - torch.log(confidence + 1e-6)
+    loss = loss_map.mean()
+
+    aux = {
+        "raw_residual": noise_residual.mean().item(),
+        "conf_mean": confidence.mean().item(),
+        "conf_min": confidence.min().item(),
+        "conf_max": confidence.max().item(),
+    }
+    return loss, pred_noise, noise, aux
+
+def train_one_epoch(model, loader, optimizer, noise_scheduler, accelerator):
+    model.train()
+    losses, residuals, conf_means, conf_mins, conf_maxs = [], [], [], [], []
+
+    for z_x, z_y in loader:
+        optimizer.zero_grad()
+        loss, _, _, aux = diffusion_step(model, noise_scheduler, z_x, z_y)
+        accelerator.backward(loss)
+        optimizer.step()
+
+        losses.append(loss.item())
+        residuals.append(aux["raw_residual"])
+        conf_means.append(aux["conf_mean"])
+        conf_mins.append(aux["conf_min"])
+        conf_maxs.append(aux["conf_max"])
+    
+    return {
+        "train_loss" : np.mean(losses),
+        "raw_residual" : np.mean(residuals),
+        "conf_mean" : np.mean(conf_means),
+        "conf_min" : np.min(conf_mins),
+        "conf_mean" : np.max(conf_maxs)
+    }
+
+def _compute_image_space_l1(model, noise_scheduler, vae, sample_fn, z_x, z_y, device, accelerator):
+    unwrapped = accelerator.unwrap_model(model)
+    z_gen = sample_fn(unwrapped, noise_scheduler, z_x, device, num_inference_steps=50)
+
+    img_pred = vae.decode(z_gen / 0.18215).sample
+    img_gt = vae.decode(z_y / 0.18215).sample
+
+    img_l1 = torch.abs(img_pred - img_gt).mean()
+    gathered = accelerator.gather_for_metrics(img_l1)
+    return gathered.mean().item()
+
+
+def _accumulate_timestep_records(model, noise_scheduler, l1_metric, z_x, z_y, t_val, device, accelerator, all_val_records):
+    noise = torch.randn_like(z_y)
+    eval_t = torch.full((z_x.shape[0],), t_val, device=device).long()
+    z_y_noisy = noise_scheduler.add_noise(z_y, noise, eval_t)
+    combined = torch.cat([z_x, z_y_noisy], dim=1)
+    pred_noise, _ = model(combined, eval_t)
+
+    g_zx, g_zy, g_pred, g_noise = accelerator.gather_for_metrics((z_x, z_y, pred_noise, noise))
+    batch_l1 = l1_metric(g_pred, g_noise).mean(dim=[1, 2, 3])
+
+    for idx in range(g_zx.shape[0]):
+        all_val_records[t_val].append({
+            'loss': batch_l1[idx].item(),
+            'sar_lat': g_zx[idx].cpu(),
+            'gt_lat': g_zy[idx].cpu(),
+        })
+
+
+EVAL_TIMESTEPS = [25, 50, 250, 500, 750, 999]
+def run_validation(model, val_loader, noise_scheduler, vae, sample_fn, device, accelerator):
+    model.eval()
+    l1_metric = nn.L1Loss(reduction='none')
+    all_val_records = {t: [] for t in EVAL_TIMESTEPS}
+    val_image_l1_errors = []
+
+    with torch.no_grad():
+        for i, (z_x, z_y) in enumerate(val_loader):
+            if i == 0:
+                val_image_l1_errors.append(
+                    _compute_image_space_l1(model, noise_scheduler, vae, sample_fn, z_x, z_y, device, accelerator)
+                ) 
+            for t_val in EVAL_TIMESTEPS:
+                _accumulate_timestep_records(model, noise_scheduler, l1_metric, z_x, z_y, t_val, device, accelerator, all_val_records)
+    
+    mean_val_l1_per_t = {t: np.mean([r['loss'] for r in recs]) for t, recs in all_val_records.items()}
+    return {
+        "per_t": mean_val_l1_per_t,
+        "mean": np.mean(list(mean_val_l1_per_t.values())),
+        "image_l1": np.mean(val_image_l1_errors) if val_image_l1_errors else float('nan'),
+        "records": all_val_records,   # needed downstream for best/worst plotting
+    }
+
+def decode_records(records_list, model, noise_scheduler, vae, sample_fn, device, accelerator):
+    unwrapped = accelerator.unwrap_model(model)
+    unwrapped.eval()
+    decoded = []
+    for item in records_list:
+        z_sar = item['sar_lat'].unsqueeze(0).to(device)
+        z_gt = item['gt_lat'].unsqueeze(0).to("cpu")
+        z_gen = sample_fn(unwrapped, noise_scheduler, z_sar, device, num_inference_steps=50)
+        decoded.append({
+            'loss': item['loss'],
+            'sar': vae.decode(z_sar.cpu() / 0.18215).sample.squeeze(0),
+            'pred': vae.decode(z_gen.cpu() / 0.18215).sample.squeeze(0),
+            'gt': vae.decode(z_gt / 0.18215).sample.squeeze(0),
+        })
+    return decoded
+
+
+def plot_best_worst(val_result, epoch, model, noise_scheduler, vae, sample_fn, device, accelerator, log_dir):
+    plot_records = sorted(val_result["records"][500], key=lambda r: r['loss'])
+    best_5 = decode_records(plot_records[:5], model, noise_scheduler, vae, sample_fn, device, accelerator)
+    worst_5 = decode_records(plot_records[-5:], model, noise_scheduler, vae, sample_fn, device, accelerator)
+    plot_performance(best_5, log_dir, tier_name=f"best_epoch_{epoch}")
+    plot_performance(worst_5, log_dir, tier_name=f"worst_epoch_{epoch}")
+
 
 @torch.no_grad()    
 def sample(model, scheduler, z_sar, device, num_inference_steps = 50):
@@ -77,9 +167,6 @@ def sample(model, scheduler, z_sar, device, num_inference_steps = 50):
         pred_noise, _ = model(concatenated_latent, timesteps = t_batch)
         z_t = sched.step(pred_noise, t, z_t).prev_sample
     return z_t 
-
-def train_one_epoch(train_loader : DataLoader, val_loader : DataLoader):
-    pass
     
 
 def main(cfg_path, resume):
@@ -128,8 +215,6 @@ def main(cfg_path, resume):
         model, optimizer, train_loader, val_loader
     )
     
-    image_l1_metric = nn.L1Loss()
-
     start_epoch = 1
     history = []  
     
@@ -147,147 +232,24 @@ def main(cfg_path, resume):
     for epoch in range(start_epoch, total_epochs + 1):
         epoch_start = time.perf_counter()
         
-        mean_val_l1 = float('nan')
-
-        mean_img_space_l1 = float('nan')
-        epoch_raw_residuals = []
-        epoch_conf_means = []
-        epoch_conf_mins = []
-        epoch_conf_maxs = []
-        
-        model.train()
-        train_losses = []
- 
-        for z_x, z_y in train_loader:
-            # z_x: SAR latent vector, z_y: EO latent vector
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (z_x.shape[0],), device = device).long()
-            noise = torch.randn_like(z_y)
-            z_y_noisy = noise_scheduler.add_noise(z_y, noise, timesteps)
+        train_stats = train_one_epoch(model, train_loader, optimizer, noise_scheduler, accelerator)
             
-            optimizer.zero_grad()
-
-            u_net_input = torch.cat([z_x, z_y_noisy], dim = 1) 
-            pred_noise, confidence = model(u_net_input, timesteps) 
-            
-            noise_residual = torch.square(noise - pred_noise)
-            epoch_raw_residuals.append(noise_residual.mean().item())
-            epoch_conf_means.append(confidence.mean().item())
-            epoch_conf_mins.append(confidence.min().item())
-            epoch_conf_maxs.append(confidence.max().item())
-
-            loss_map = noise_residual * confidence - torch.log(confidence + 1e-6) 
-            loss = loss_map.mean()
-            
-            accelerator.backward(loss)
-            optimizer.step()
-            
-            train_losses.append(loss.item())
-            
+        val_result = None
         if epoch % 10 == 0 or epoch == total_epochs:
-            model.eval()
-            l1_metric = nn.L1Loss(reduction='none')
-            eval_timesteps = [25, 50, 250, 500, 750, 999]
+            val_result = run_validation(model, val_loader, noise_scheduler, vae, sample, device, accelerator)
             
-            all_val_records = {t : [] for t in eval_timesteps}   # dict of lists (eval values for each ts)
-            val_image_l1_errors = []
+            if accelerator.is_main_process:       
+                plot_best_worst(val_result, epoch, model, noise_scheduler, vae, sample, device, accelerator, log_dir)
 
-            with torch.no_grad():
-                first_batch = True
-                for z_x, z_y in val_loader:
-                    if first_batch:
-                        unwrapped_model = accelerator.unwrap_model(model)
-                        z_gen = sample(unwrapped_model, noise_scheduler, z_x, device, num_inference_steps=50)
-                        
-                        # Decoded image comparisons
-                        img_pred = vae.decode(z_gen / 0.18215).sample
-                        img_gt = vae.decode(z_y / 0.18215).sample
-                        
-                        img_l1 = image_l1_metric(img_pred, img_gt)
-                        gathered_img_l1 = accelerator.gather_for_metrics(img_l1)
-                        val_image_l1_errors.append(gathered_img_l1.mean().item())
-                        first_batch = False
-
-                    for t_val in eval_timesteps:
-                        # perform an abbreviated reverse denoising loop step for eval verification
-                        noise = torch.randn_like(z_y)    
-                        eval_t = torch.full((z_x.shape[0],), t_val, device = device).long()
-                        
-                        z_y_noisy = noise_scheduler.add_noise(z_y, noise, eval_t)
-                        
-                        combined = torch.cat([z_x, z_y_noisy], dim = 1) 
-                        pred_noise, _ = model(combined, eval_t)
-                
-                        # Gather individual tensors back across process boundaries safely
-                        gathered_z_x, gathered_z_y, gathered_pred_noise, gathered_noise = accelerator.gather_for_metrics(
-                            (z_x, z_y, pred_noise, noise)
-                        )
-                        
-                        # directly compute l1 pixel loss [netween generated eo (decoded o/p) and eo]
-                        batch_l1 = l1_metric(gathered_pred_noise, gathered_noise).mean(dim = [1, 2, 3])
-                    
-                        for idx in range(gathered_z_x.shape[0]):
-                            all_val_records[t_val].append({
-                                'loss': batch_l1[idx].item(),
-                                'sar_lat': gathered_z_x[idx].cpu(),
-                                'gt_lat': gathered_z_y[idx].cpu()
-                            })
-                    
-            
-            if accelerator.is_main_process:
-                mean_val_l1_per_t = {t : np.mean([r['loss'] for r in recs]) for t, recs in all_val_records.items()}
-                mean_val_l1 = np.mean(list(mean_val_l1_per_t.values()))
-                mean_img_space_l1 = np.mean(val_image_l1_errors)
-                
-                # pick t=500 — the harder, more informative regime for best/worst plots
-                plot_records = all_val_records[500] 
-                plot_records.sort(key = lambda item : item['loss'])
-                best_5_samples = plot_records[:5]
-                worst_5_samples = plot_records[-5:] 
-                                
-                def decode_records(records_list):
-                    decoded_samples = []
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    unwrapped_model.eval()
-                    
-                    for item in records_list:
-                        # Add batch axis, push to device, decode to pixels, and strip batch axis
-                        z_sar = item['sar_lat'].unsqueeze(0).to(device)
-                        z_gt = item['gt_lat'].unsqueeze(0).to("cpu")
-                        
-                        z_gen = sample(unwrapped_model, noise_scheduler, z_sar, device, num_inference_steps = 50)
-                        
-                        decoded_samples.append({
-                            'loss': item['loss'],
-                            'sar': vae.decode(z_sar.cpu() / 0.18215).sample.squeeze(0),
-                            'pred': vae.decode(z_gen.cpu() / 0.18215).sample.squeeze(0),
-                            'gt': vae.decode(z_gt / 0.18215).sample.squeeze(0)
-                        })
-                        
-                    return decoded_samples
-
-                best_5_samples = decode_records(best_5_samples)
-                worst_5_samples = decode_records(worst_5_samples)
-                
-                plot_performance(best_5_samples, log_dir, tier_name=f"best_epoch_{epoch}")
-                plot_performance(worst_5_samples, log_dir, tier_name=f"worst_epoch_{epoch}")                
-            
         if accelerator.is_main_process:    
-            elapsed_time = time.perf_counter() - epoch_start
-            mean_train_loss = np.mean(train_losses)
-            
-            val_str = f"{mean_val_l1:.4f}" if not np.isnan(mean_val_l1) else "Skipped"
-            img_val_str = f"{mean_img_space_l1:.4f}" if not np.isnan(mean_img_space_l1) else "Skipped"
+            elapsed = time.perf_counter() - epoch_start
+            log_epoch(epoch, total_epochs, elapsed, train_stats, val_result)
 
-            print(f"Epoch {epoch:03d}/{total_epochs} | Train Loss: {mean_train_loss:.4f} | Val L1 Error: {val_str} | Time: {elapsed_time:.1f}s")
-            print(f"  ├── Train Composite Loss: {mean_train_loss:.4f} | Raw Residual Mean: {np.mean(epoch_raw_residuals):.4f}")
-            print(f"  ├── Confidence Status   -> Mean: {np.mean(epoch_conf_means):.4f} | Min: {np.min(epoch_conf_mins):.4f} | Max: {np.max(epoch_conf_maxs):.4f}")
-            print(f"  └── Eval Noise L1 (Avg): {val_str} | Image Pixel Space L1: {img_val_str}")
-            
-            if epoch % 10 == 0 or epoch == total_epochs:
-                t_diagnostics = ", ".join([f"t{t}:{mean_val_l1_per_t[t]:.4f}" for t in sorted(mean_val_l1_per_t.keys())])
-                print(f"        └──► Timestep Grid Loss: {t_diagnostics}")
-                
-            history.append({"epoch": epoch, "train_loss": mean_train_loss, "val_l1": mean_val_l1_per_t.values()})
+            history.append({
+                "epoch": epoch, 
+                "train_loss": train_stats["train_loss"], 
+                "val_l1": dict(val_result["per_t"]) if val_result else None,
+            })
             
             # save_checkpoint(full_ckpt_path, epoch, model, optimizer, scaler, history)
             torch.save({
@@ -298,26 +260,6 @@ def main(cfg_path, resume):
             }, full_ckpt_path)
         
         accelerator.wait_for_everyone()
-    
-    if accelerator.is_main_process:
-        # --- persist raw loss values + plot, as required by the assignment ---
-        csv_path = os.path.join(log_dir, "loss_metrics.csv")
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_l1"])
-            writer.writeheader()
-            writer.writerows(history)
-    
-        epochs = [h["epoch"] for h in history]
-        plt.figure(figsize=(8, 5))
-        plt.plot(epochs, [h["train_loss"] for h in history], label="Train C-Diff Loss")
-        plt.plot(epochs, [h["val_l1"] for h in history], label="Val L1 Reconstruction Pixel Loss")
-        plt.xlabel("Epoch Count")
-        plt.ylabel("Loss Index")
-        plt.title("C-DiffSET Training Convergence Diagnostics Summary")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(os.path.join(log_dir, "loss_diagnostic_curve.png"))
-        print(f"[PROCESS COMPLETED] Logs safely cataloged to {log_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
