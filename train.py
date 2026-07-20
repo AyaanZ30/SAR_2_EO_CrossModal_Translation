@@ -70,7 +70,7 @@ def train_one_epoch(model, loader, optimizer, noise_scheduler, accelerator):
         "raw_residual" : np.mean(residuals),
         "conf_mean" : np.mean(conf_means),
         "conf_min" : np.min(conf_mins),
-        "conf_mean" : np.max(conf_maxs)
+        "conf_max" : np.max(conf_maxs)
     }
 
 def _compute_image_space_l1(model, noise_scheduler, vae, sample_fn, z_x, z_y, device, accelerator):
