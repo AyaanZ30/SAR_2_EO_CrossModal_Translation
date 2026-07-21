@@ -14,6 +14,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from diffusers import AutoencoderKL, DDPMScheduler
  
 from utils.plots import plot_performance
@@ -181,7 +182,12 @@ def main(cfg_path, resume):
     
     set_seed(cfg["seed"])
     
-    accelerator = Accelerator(mixed_precision = "fp16" if torch.cuda.is_available() else "no")
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters = True)
+    accelerator = Accelerator(
+        mixed_precision = "fp16" if torch.cuda.is_available() else "no",
+        kwargs_handlers = [ddp_kwargs]
+    )
+
     device = accelerator.device
     
     ckpt_dir = cfg["train"]["checkpoint_dir"]
