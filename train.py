@@ -28,6 +28,27 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+def min_snr_weighted_mse(pred_noise, noise, timesteps, noise_scheduler, gamma = 5.0):
+    """
+    In a DDPM noise schedule, (alpha-bar) represents the cumulative amount of original clean image structure preserved at time t
+    SNR (at time t) = (alpha_bar_t / 1 - alpha_bar_t)   [at t:0, no noise & at t:1, pure noise]
+    """
+    alphas_cumprod = noise_scheduler.alphas_cumprod.to(timesteps.device)
+    alpha_bar_t = alphas_cumprod[timesteps]
+    snr = alpha_bar_t / (1 - alpha_bar_t)
+    min_snr_gamma = torch.clamp(snr, max = gamma)
+    weight = min_snr_gamma / snr  # per-sample scaling factor 
+
+    per_sample_mse = torch.square(noise - pred_noise).mean(dim=[1, 2, 3])
+    weighted_loss = (weight * per_sample_mse).mean()
+    return weighted_loss
+
+def update_ema(ema_model, model, decay = 0.999):
+    with torch.no_grad():
+        msd = model.state_dict()
+        for k, v in ema_model.state_dict().items():
+            v.copy_(v * decay + msd[k].detach().to(v.device) * (1 - decay)) 
+
 def diffusion_step(model, noise_scheduler, z_x, z_y, timesteps = None):
     """Runs one forward pass of noise prediction + confidence, returns loss and raw components."""
     if timesteps is None: 
@@ -35,43 +56,28 @@ def diffusion_step(model, noise_scheduler, z_x, z_y, timesteps = None):
     noise = torch.randn_like(z_y)
     z_y_noisy = noise_scheduler.add_noise(z_y, noise, timesteps)
     u_net_input = torch.cat([z_x, z_y_noisy], dim=1)
-    pred_noise, confidence = model(u_net_input, timesteps)
+    pred_noise, _ = model(u_net_input, timesteps)
 
-    noise_residual = torch.square(noise - pred_noise)
-    loss_map = noise_residual * confidence - torch.log(confidence + 1e-6)
-    loss = loss_map.mean()
+    loss = min_snr_weighted_mse(pred_noise, noise, timesteps, noise_scheduler, gamma = 5.0)
+    return loss, pred_noise, noise
 
-    aux = {
-        "raw_residual": noise_residual.mean().item(),
-        "conf_mean": confidence.mean().item(),
-        "conf_min": confidence.min().item(),
-        "conf_max": confidence.max().item(),
-    }
-    return loss, pred_noise, noise, aux
 
-def train_one_epoch(model, loader, optimizer, noise_scheduler, accelerator):
+def train_one_epoch(model, ema_model, loader, optimizer, noise_scheduler, accelerator, ema_decay=0.999):
     model.train()
-    losses, residuals, conf_means, conf_mins, conf_maxs = [], [], [], [], []
+    losses = []
 
     for z_x, z_y in loader:
         optimizer.zero_grad()
-        loss, _, _, aux = diffusion_step(model, noise_scheduler, z_x, z_y)
+        loss, _, _, = diffusion_step(model, noise_scheduler, z_x, z_y)
         accelerator.backward(loss)
         optimizer.step()
 
+        if accelerator.is_main_process:
+            update_ema(ema_model, accelerator.unwrap_model(model), decay = ema_decay) 
+        
         losses.append(loss.item())
-        residuals.append(aux["raw_residual"])
-        conf_means.append(aux["conf_mean"])
-        conf_mins.append(aux["conf_min"])
-        conf_maxs.append(aux["conf_max"])
-    
-    return {
-        "train_loss" : np.mean(losses),
-        "raw_residual" : np.mean(residuals),
-        "conf_mean" : np.mean(conf_means),
-        "conf_min" : np.min(conf_mins),
-        "conf_max" : np.max(conf_maxs)
-    }
+
+    return {"train_loss" : np.mean(losses)}
 
 def _compute_image_space_l1(model, noise_scheduler, vae, sample_fn, z_x, z_y, device, accelerator):
     unwrapped = accelerator.unwrap_model(model)
@@ -214,6 +220,13 @@ def main(cfg_path, resume):
     model, optimizer, train_loader, val_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader
     )
+
+    ema_model = None
+    if accelerator.is_main_process:
+        from copy import deepcopy
+        ema_model = deepcopy(accelerator.unwrap_model(model)).eval()
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
     
     start_epoch = 1
     history = []  
@@ -221,25 +234,30 @@ def main(cfg_path, resume):
     if resume and os.path.exists(full_ckpt_path):
         # start_epoch, history = load_checkpoint(full_ckpt_path, model, optimizer, scaler, device)
         accelerator.wait_for_everyone()
+
         ckpt = torch.load(full_ckpt_path, map_location=device, weights_only=False)
-        
         accelerator.unwrap_model(model).load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         start_epoch = ckpt["epoch"] + 1
         history = ckpt["history"]
 
+        if accelerator.is_main_process and "ema_model_state" in ckpt:
+            ema_model.load_state_dict(ckpt["ema_model_state"])
+
+
     total_epochs = cfg["train"]["epochs"]
     for epoch in range(start_epoch, total_epochs + 1):
         epoch_start = time.perf_counter()
         
-        train_stats = train_one_epoch(model, train_loader, optimizer, noise_scheduler, accelerator)
+        train_stats = train_one_epoch(model, ema_model, train_loader, optimizer, noise_scheduler, accelerator)
             
         val_result = None
         if epoch % 10 == 0 or epoch == total_epochs:
-            val_result = run_validation(model, val_loader, noise_scheduler, vae, sample, device, accelerator)
+            eval_model = ema_model if accelerator.is_main_process else model
+            val_result = run_validation(eval_model, val_loader, noise_scheduler, vae, sample, device, accelerator)
             
             if accelerator.is_main_process:       
-                plot_best_worst(val_result, epoch, model, noise_scheduler, vae, sample, device, accelerator, log_dir)
+                plot_best_worst(val_result, epoch, eval_model, noise_scheduler, vae, sample, device, accelerator, log_dir)
 
         if accelerator.is_main_process:    
             elapsed = time.perf_counter() - epoch_start
@@ -255,6 +273,7 @@ def main(cfg_path, resume):
             torch.save({
                 "epoch": epoch,
                 "model_state": accelerator.unwrap_model(model).state_dict(),
+                "ema_model_state" : ema_model.state_dict() if ema_model is not None else None,
                 "optimizer_state": optimizer.state_dict(),
                 "history": history,
             }, full_ckpt_path)
