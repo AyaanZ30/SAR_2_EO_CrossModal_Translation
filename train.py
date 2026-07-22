@@ -219,7 +219,7 @@ def main(cfg_path, resume):
     val_loader = DataLoader(val_ds, batch_size=cfg["train"]["batch_size"], shuffle=False, num_workers=cfg["train"]["num_workers"], pin_memory=True)
     
     noise_scheduler = DDPMScheduler(num_train_timesteps = 1000)
-    model = CDiffSETUNet(latent_channels = cfg["model"]["latent_channels"], base_channels = cfg["model"]["base_channels"])
+    model = CDiffSETUNet(latent_ch = cfg["model"]["latent_channels"], base_ch = cfg["model"]["base_channels"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]), weight_decay=1e-4)
 
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to("cpu")
