@@ -15,13 +15,13 @@ import matplotlib.pyplot as plt
 
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
-from diffusers import AutoencoderKL, DDPMScheduler
+from diffusers import AutoencoderKL, DDPMScheduler, DDIMScheduler
  
-from utils.plots import plot_performance
-from utils.logging import log_epoch
+from C_Diff.utils.plots import plot_performance
+from C_Diff.utils.logging import log_epoch
 
-from src.dataset import list_roi_ids, split_roi_ids, PrecomputedLatentDataset
-from src.model import CDiffSETUNet, SpatialGradientLoss
+from C_Diff.image_datasets import list_roi_ids, split_roi_ids, PrecomputedLatentDataset
+from C_Diff.model import CDiffSETUNet
 
 def set_seed(seed):
     random.seed(seed)
@@ -56,6 +56,7 @@ def diffusion_step(model, noise_scheduler, z_x, z_y, timesteps = None):
         timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (z_x.shape[0],), device = z_x.device).long()
     noise = torch.randn_like(z_y)
     z_y_noisy = noise_scheduler.add_noise(z_y, noise, timesteps)
+
     u_net_input = torch.cat([z_x, z_y_noisy], dim=1)
     pred_noise, _ = model(u_net_input, timesteps)
 
@@ -82,14 +83,14 @@ def train_one_epoch(model, ema_model, loader, optimizer, noise_scheduler, accele
 
 def _compute_image_space_l1(model, noise_scheduler, vae, sample_fn, z_x, z_y, device, accelerator):
     unwrapped = accelerator.unwrap_model(model)
-    z_gen = sample_fn(unwrapped, noise_scheduler, z_x, device, num_inference_steps=50)
+    z_gen = sample_fn(unwrapped, noise_scheduler, z_x, device, num_inference_steps = 1000)
 
     img_pred = vae.decode((z_gen.cpu()) / 0.18215).sample
     img_gt = vae.decode((z_y.cpu()) / 0.18215).sample
 
     img_l1 = torch.abs(img_pred - img_gt).mean(dim = [1, 2, 3])
     img_l1 = img_l1.to(device)
-    
+
     gathered = accelerator.gather_for_metrics(img_l1)
     return gathered.mean().item()
 
@@ -162,11 +163,12 @@ def plot_best_worst(val_result, epoch, model, noise_scheduler, vae, sample_fn, d
 
 
 @torch.no_grad()    
-def sample(model, scheduler, z_sar, device, num_inference_steps = 50):
+def sample(model, scheduler, z_sar, device, num_inference_steps = 1000):
     """Iterative DDPM reverse sampling conditioned on a SAR latent (more sophisticated than subtraction of noise)"""
     z_sar = z_sar.to(device)
 
-    sched = DDPMScheduler(num_train_timesteps = scheduler.config.num_train_timesteps)
+    # sched = DDPMScheduler(num_train_timesteps = scheduler.config.num_train_timesteps)
+    sched = DDIMScheduler(num_train_timesteps = scheduler.config.num_train_timesteps)
     sched.set_timesteps(num_inference_steps, device=device)
     
     z_t = torch.randn_like(z_sar, device = device)
@@ -240,7 +242,6 @@ def main(cfg_path, resume):
     history = []  
     
     if resume and os.path.exists(full_ckpt_path):
-        # start_epoch, history = load_checkpoint(full_ckpt_path, model, optimizer, scaler, device)
         accelerator.wait_for_everyone()
 
         ckpt = torch.load(full_ckpt_path, map_location=device, weights_only=False)
@@ -291,7 +292,7 @@ def main(cfg_path, resume):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--resume", action="store_true", help="resume from checkpoint_dir/training_state.pt")
+    parser.add_argument("--resume", action="store_true", help="resume from checkpoint_dir/  ")
     args = parser.parse_args()
     main(args.config, args.resume)
     
