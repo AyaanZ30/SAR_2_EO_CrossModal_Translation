@@ -57,8 +57,8 @@ def diffusion_step(model, noise_scheduler, z_x, z_y, timesteps = None):
     noise = torch.randn_like(z_y)
     z_y_noisy = noise_scheduler.add_noise(z_y, noise, timesteps)
 
-    u_net_input = torch.cat([z_x, z_y_noisy], dim=1)
-    pred_noise, _ = model(u_net_input, timesteps)
+    # u_net_input = torch.cat([z_x, z_y_noisy], dim=1)
+    pred_noise, _ = model(z_x, z_y_noisy, timesteps)
 
     loss = min_snr_weighted_mse(pred_noise, noise, timesteps, noise_scheduler, gamma = 5.0)
     return loss, pred_noise, noise
@@ -83,7 +83,7 @@ def train_one_epoch(model, ema_model, loader, optimizer, noise_scheduler, accele
 
 def _compute_image_space_l1(model, noise_scheduler, vae, sample_fn, z_x, z_y, device, accelerator):
     unwrapped = accelerator.unwrap_model(model)
-    z_gen = sample_fn(unwrapped, noise_scheduler, z_x, device, num_inference_steps = 1000)
+    z_gen = sample_fn(unwrapped, noise_scheduler, z_x, device, num_inference_steps = 250)
 
     img_pred = vae.decode((z_gen.cpu()) / 0.18215).sample
     img_gt = vae.decode((z_y.cpu()) / 0.18215).sample
@@ -99,8 +99,9 @@ def _accumulate_timestep_records(model, noise_scheduler, l1_metric, z_x, z_y, t_
     noise = torch.randn_like(z_y)
     eval_t = torch.full((z_x.shape[0],), t_val, device=device).long()
     z_y_noisy = noise_scheduler.add_noise(z_y, noise, eval_t)
-    combined = torch.cat([z_x, z_y_noisy], dim=1)
-    pred_noise, _ = model(combined, eval_t)
+
+    # combined = torch.cat([z_x, z_y_noisy], dim=1)
+    pred_noise, _ = model(z_x, z_y_noisy, eval_t)
 
     g_zx, g_zy, g_pred, g_noise = accelerator.gather_for_metrics((z_x, z_y, pred_noise, noise))
     batch_l1 = l1_metric(g_pred, g_noise).mean(dim=[1, 2, 3])
@@ -144,7 +145,7 @@ def decode_records(records_list, model, noise_scheduler, vae, sample_fn, device,
     for item in records_list:
         z_sar = item['sar_lat'].unsqueeze(0).to(device)
         z_gt = item['gt_lat'].unsqueeze(0).to("cpu")
-        z_gen = sample_fn(unwrapped, noise_scheduler, z_sar, device, num_inference_steps=50)
+        z_gen = sample_fn(unwrapped, noise_scheduler, z_sar, device, num_inference_steps=250)
         decoded.append({
             'loss': item['loss'],
             'sar': vae.decode(z_sar.cpu() / 0.18215).sample.squeeze(0),
@@ -163,19 +164,25 @@ def plot_best_worst(val_result, epoch, model, noise_scheduler, vae, sample_fn, d
 
 
 @torch.no_grad()    
-def sample(model, scheduler, z_sar, device, num_inference_steps = 1000):
+def sample(model, scheduler, z_sar, device, num_inference_steps = 250, guidance_scale = 3.0):
     """Iterative DDPM reverse sampling conditioned on a SAR latent (more sophisticated than subtraction of noise)"""
     z_sar = z_sar.to(device)
+    z_sar_uncond = torch.zeros_like(z_sar)
 
-    # sched = DDPMScheduler(num_train_timesteps = scheduler.config.num_train_timesteps)
-    sched = DDIMScheduler(num_train_timesteps = scheduler.config.num_train_timesteps)
+    sched = DDPMScheduler(num_train_timesteps = scheduler.config.num_train_timesteps)
+    # sched = DDIMScheduler(num_train_timesteps = scheduler.config.num_train_timesteps)
     sched.set_timesteps(num_inference_steps, device=device)
     
     z_t = torch.randn_like(z_sar, device = device)
     for t in sched.timesteps:
         t_batch = torch.full((z_sar.shape[0],), t, device=device, dtype=torch.long)
-        concatenated_latent = torch.cat([z_sar, z_t], dim = 1)
-        pred_noise, _ = model(concatenated_latent, timesteps = t_batch)
+
+        # concatenated_latent = torch.cat([z_sar, z_t], dim = 1)
+        pred_cond, _ = model(z_sar, z_t, t_batch)
+        pred_uncond, _ = model(z_sar_uncond, z_t, t_batch)
+
+        # pred_noise, _ = model(concatenated_latent, timesteps = t_batch)
+        pred_noise = pred_uncond + (guidance_scale * (pred_cond - pred_uncond))
         z_t = sched.step(pred_noise, t, z_t).prev_sample
     return z_t 
     
