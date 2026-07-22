@@ -167,7 +167,7 @@ def plot_best_worst(val_result, epoch, model, noise_scheduler, vae, sample_fn, d
 
 
 @torch.no_grad()    
-def sample(model, scheduler, z_sar, device, num_inference_steps = 250, guidance_scale = 3.0):
+def sample(model, scheduler, z_sar, device, num_inference_steps = 250, guidance_scale = 6.0):
     """Iterative DDPM reverse sampling conditioned on a SAR latent (more sophisticated than subtraction of noise)"""
     z_sar = z_sar.to(device)
     z_sar_uncond = torch.zeros_like(z_sar)
