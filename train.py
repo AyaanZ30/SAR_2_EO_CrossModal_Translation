@@ -50,15 +50,18 @@ def update_ema(ema_model, model, decay = 0.999):
         for k, v in ema_model.state_dict().items():
             v.copy_(v * decay + msd[k].detach().to(v.device) * (1 - decay)) 
 
-def diffusion_step(model, noise_scheduler, z_x, z_y, timesteps = None):
+def diffusion_step(model, noise_scheduler, z_x, z_y, timesteps = None, cond_drop_prob = 0.15):
     """Runs one forward pass of noise prediction + confidence, returns loss and raw components."""
     if timesteps is None: 
         timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (z_x.shape[0],), device = z_x.device).long()
     noise = torch.randn_like(z_y)
     z_y_noisy = noise_scheduler.add_noise(z_y, noise, timesteps)
 
+    drop_mask = (torch.rand(z_x.shape[0], device = z_x.device) < cond_drop_prob).view(-1, 1, 1, 1)
+    z_x_input = torch.where(drop_mask, torch.zeros_like(z_x), z_x)
+
     # u_net_input = torch.cat([z_x, z_y_noisy], dim=1)
-    pred_noise, _ = model(z_x, z_y_noisy, timesteps)
+    pred_noise, _ = model(z_x_input, z_y_noisy, timesteps)
 
     loss = min_snr_weighted_mse(pred_noise, noise, timesteps, noise_scheduler, gamma = 5.0)
     return loss, pred_noise, noise
