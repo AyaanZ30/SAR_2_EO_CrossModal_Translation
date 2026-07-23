@@ -64,11 +64,11 @@ def diffusion_step(model, noise_scheduler, z_x, z_y, timesteps = None, cond_drop
     pred_noise, _ = model(z_x_input, z_y_noisy, timesteps)
 
     noise_loss = min_snr_weighted_mse(pred_noise, noise, timesteps, noise_scheduler, gamma = 5.0)
-    color_loss = color_supervision_loss(z_y_noisy, pred_noise, z_y, timesteps, noise_scheduler)
-    edge_loss = edge_preservation_loss(z_y_noisy, pred_noise, z_y, timesteps, noise_scheduler)
+    # color_loss = color_supervision_loss(z_y_noisy, pred_noise, z_y, timesteps, noise_scheduler)
+    # edge_loss = edge_preservation_loss(z_y_noisy, pred_noise, z_y, timesteps, noise_scheduler)
 
-    total_loss = noise_loss + (0.6 * color_loss) + (1.0 * edge_loss)
-    return total_loss, pred_noise, noise
+    # total_loss = noise_loss + (0.6 * color_loss) + (1.0 * edge_loss)
+    return noise_loss, pred_noise, noise
 
 
 def train_one_epoch(model, ema_model, loader, optimizer, noise_scheduler, accelerator, ema_decay=0.999):
