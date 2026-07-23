@@ -77,3 +77,24 @@ class CDiffUpBlock(nn.Module):
         for block in self.res_blocks:
             x = x + F.silu(block(x))
         return x
+
+class DilatedBottleneck(nn.Module):
+    """
+    Plain bottlenech conv <--> Parallel Dilated convolutons (for broader receptive field)
+    Captures more global multi-scale context cheaply (without attention cost)
+    """
+    def __init__(self, ch):
+        super().__init__()
+        self.branch1 = nn.Conv2d(ch, ch // 4, kernel_size=3, padding=1, dilation=1)
+        self.branch2 = nn.Conv2d(ch, ch // 4, kernel_size=3, padding=2, dilation=2)
+        self.branch3 = nn.Conv2d(ch, ch // 4, kernel_size=3, padding=4, dilation=4)
+        self.branch4 = nn.Conv2d(ch, ch // 4, kernel_size=3, padding=8, dilation=8)
+        self.project = nn.Sequential(
+            nn.Conv2d(ch, ch, kernel_size=1),
+            nn.GroupNorm(8, ch),
+            nn.SiLU()
+        )
+
+    def forward(self, x):
+        out = torch.cat([self.branch1(x), self.branch2(x), self.branch3(x), self.branch4(x)], dim=1)
+        return x + self.proj(out)

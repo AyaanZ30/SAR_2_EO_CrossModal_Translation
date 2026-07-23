@@ -4,8 +4,7 @@ import torch.nn.functional as F
 from typing import Tuple
 
 from .timesteps import TimeEmbedding
-from .losses import SpatialGradientLoss
-from .blocks import CDiffUpBlock, CDiffDownBlock
+from .blocks import CDiffUpBlock, CDiffDownBlock, DilatedBottleneck
 
 class SAREncoder(nn.Module):
     """
@@ -64,11 +63,12 @@ class CDiffSETUNet(nn.Module):
         self.down2 = CDiffDownBlock(base_ch * 2, base_ch * 4, time_dim, num_res_blocks)
         self.down3 = CDiffDownBlock(base_ch * 4, base_ch * 8, time_dim, num_res_blocks)        
         
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(base_ch * 8, base_ch * 8, kernel_size = 3, padding = 1),
-            nn.GroupNorm(8, base_ch * 8),
-            nn.SiLU()
-        )
+        # self.bottleneck = nn.Sequential(
+        #     nn.Conv2d(base_ch * 8, base_ch * 8, kernel_size = 3, padding = 1),
+        #     nn.GroupNorm(8, base_ch * 8),
+        #     nn.SiLU()
+        # )
+        self.bottleneck = DilatedBottleneck(base_ch * 8)
         
         self.up3 = CDiffUpBlock(base_ch * 8, base_ch * 4, time_dim, num_res_blocks)
         self.up2 = CDiffUpBlock(base_ch * 4, base_ch * 2, time_dim, num_res_blocks)

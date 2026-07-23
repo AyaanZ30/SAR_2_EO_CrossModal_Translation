@@ -22,7 +22,7 @@ from C_Diff.utils.logging import log_epoch
 
 from C_Diff.image_datasets import list_roi_ids, split_roi_ids, PrecomputedLatentDataset
 from C_Diff.model import CDiffSETUNet
-from C_Diff.losses import color_supervision_loss
+from C_Diff.losses import color_supervision_loss, edge_preservation_loss
 
 def set_seed(seed):
     random.seed(seed)
@@ -65,8 +65,9 @@ def diffusion_step(model, noise_scheduler, z_x, z_y, timesteps = None, cond_drop
 
     noise_loss = min_snr_weighted_mse(pred_noise, noise, timesteps, noise_scheduler, gamma = 5.0)
     color_loss = color_supervision_loss(z_y_noisy, pred_noise, z_y, timesteps, noise_scheduler)
-    total_loss = noise_loss + (0.6 * color_loss)
+    edge_loss = edge_preservation_loss(z_y_noisy, pred_noise, z_y, timesteps, noise_scheduler)
 
+    total_loss = noise_loss + (0.6 * color_loss) + (1.0 * edge_loss)
     return total_loss, pred_noise, noise
 
 

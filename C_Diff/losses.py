@@ -25,3 +25,13 @@ def color_supervision_loss(z_y_noisy, pred_noise, z_y_clean, timesteps, noise_sc
     x0_gt_blur = gaussian_blur(z_y_clean, kernel_size, sigma)
 
     return F.mse_loss(x0_pred_blur, x0_gt_blur)
+
+def edge_preservation_loss(z_y_noisy, pred_noise, z_y_clean, timesteps, noise_scheduler):
+    x0_pred = reconstruct_image_x0(z_y_noisy, pred_noise, timesteps, noise_scheduler)  # reuse from color loss
+
+    pred_grad_x = x0_pred[:, :, :, :-1] - x0_pred[:, :, :, 1:]
+    target_grad_x = z_y_clean[:, :, :, :-1] - z_y_clean[:, :, :, 1:]
+    pred_grad_y = x0_pred[:, :, :-1, :] - x0_pred[:, :, 1:, :]
+    target_grad_y = z_y_clean[:, :, :-1, :] - z_y_clean[:, :, 1:, :]
+
+    return F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
