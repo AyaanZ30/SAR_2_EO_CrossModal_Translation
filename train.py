@@ -22,6 +22,7 @@ from C_Diff.utils.logging import log_epoch
 
 from C_Diff.image_datasets import list_roi_ids, split_roi_ids, PrecomputedLatentDataset
 from C_Diff.model import CDiffSETUNet
+from C_Diff.losses import color_supervision_loss
 
 def set_seed(seed):
     random.seed(seed)
@@ -60,11 +61,13 @@ def diffusion_step(model, noise_scheduler, z_x, z_y, timesteps = None, cond_drop
     drop_mask = (torch.rand(z_x.shape[0], device = z_x.device) < cond_drop_prob).view(-1, 1, 1, 1)
     z_x_input = torch.where(drop_mask, torch.zeros_like(z_x), z_x)
 
-    # u_net_input = torch.cat([z_x, z_y_noisy], dim=1)
     pred_noise, _ = model(z_x_input, z_y_noisy, timesteps)
 
-    loss = min_snr_weighted_mse(pred_noise, noise, timesteps, noise_scheduler, gamma = 5.0)
-    return loss, pred_noise, noise
+    noise_loss = min_snr_weighted_mse(pred_noise, noise, timesteps, noise_scheduler, gamma = 5.0)
+    color_loss = color_supervision_loss(z_y_noisy, pred_noise, z_y, timesteps, noise_scheduler)
+    total_loss = noise_loss + (0.6 * color_loss)
+
+    return total_loss, pred_noise, noise
 
 
 def train_one_epoch(model, ema_model, loader, optimizer, noise_scheduler, accelerator, ema_decay=0.999):
