@@ -7,7 +7,6 @@ import yaml
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 import matplotlib
 matplotlib.use("Agg")
@@ -15,14 +14,14 @@ import matplotlib.pyplot as plt
 
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
-from diffusers import AutoencoderKL, DDPMScheduler, DDIMScheduler
+from diffusers import DDPMScheduler
+
+from eo_vae.models.new_autoencoder import EOFluxVAE
  
 from C_Diff.utils.plots import plot_performance
 from C_Diff.utils.logging import log_epoch
-
 from C_Diff.image_datasets import list_roi_ids, split_roi_ids, PrecomputedLatentDataset
 from C_Diff.model import CDiffSETUNet
-from C_Diff.losses import color_supervision_loss, edge_preservation_loss
 
 def set_seed(seed):
     random.seed(seed)
@@ -64,10 +63,6 @@ def diffusion_step(model, noise_scheduler, z_x, z_y, timesteps = None, cond_drop
     pred_noise, _ = model(z_x_input, z_y_noisy, timesteps)
 
     noise_loss = min_snr_weighted_mse(pred_noise, noise, timesteps, noise_scheduler, gamma = 5.0)
-    # color_loss = color_supervision_loss(z_y_noisy, pred_noise, z_y, timesteps, noise_scheduler)
-    # edge_loss = edge_preservation_loss(z_y_noisy, pred_noise, z_y, timesteps, noise_scheduler)
-
-    # total_loss = noise_loss + (0.6 * color_loss) + (1.0 * edge_loss)
     return noise_loss, pred_noise, noise
 
 
@@ -88,12 +83,14 @@ def train_one_epoch(model, ema_model, loader, optimizer, noise_scheduler, accele
 
     return {"train_loss" : np.mean(losses)}
 
-def _compute_image_space_l1(model, noise_scheduler, vae, sample_fn, z_x, z_y, device, accelerator):
+def _compute_image_space_l1(model, noise_scheduler, vae, sample_fn, z_x, z_y, device, accelerator, s2_wvs):
     unwrapped = accelerator.unwrap_model(model)
     z_gen = sample_fn(unwrapped, noise_scheduler, z_x, device, num_inference_steps = 250)
 
-    img_pred = vae.decode((z_gen.cpu()) / 0.18215).sample
-    img_gt = vae.decode((z_y.cpu()) / 0.18215).sample
+    # img_pred = vae.decode((z_gen.cpu()) / 0.18215).sample
+    # img_gt = vae.decode((z_y.cpu()) / 0.18215).sample
+    img_pred = vae.decode_spatial_normalized(z_gen.cpu(), s2_wvs)
+    img_gt = vae.decode_spatial_normalized(z_y.cpu(), s2_wvs)
 
     img_l1 = torch.abs(img_pred - img_gt).mean(dim = [1, 2, 3])
     img_l1 = img_l1.to(device)
@@ -107,7 +104,6 @@ def _accumulate_timestep_records(model, noise_scheduler, l1_metric, z_x, z_y, t_
     eval_t = torch.full((z_x.shape[0],), t_val, device=device).long()
     z_y_noisy = noise_scheduler.add_noise(z_y, noise, eval_t)
 
-    # combined = torch.cat([z_x, z_y_noisy], dim=1)
     pred_noise, _ = model(z_x, z_y_noisy, eval_t)
 
     g_zx, g_zy, g_pred, g_noise = accelerator.gather_for_metrics((z_x, z_y, pred_noise, noise))
@@ -122,7 +118,7 @@ def _accumulate_timestep_records(model, noise_scheduler, l1_metric, z_x, z_y, t_
 
 
 EVAL_TIMESTEPS = [25, 50, 250, 500, 750, 999]
-def run_validation(model, val_loader, noise_scheduler, vae, sample_fn, device, accelerator):
+def run_validation(model, val_loader, noise_scheduler, vae, sample_fn, device, accelerator, s2_wvs, s1_wvs):
     model.eval()
     l1_metric = nn.L1Loss(reduction='none')
     all_val_records = {t: [] for t in EVAL_TIMESTEPS}
@@ -132,7 +128,7 @@ def run_validation(model, val_loader, noise_scheduler, vae, sample_fn, device, a
         for i, (z_x, z_y) in enumerate(val_loader):
             if i == 0:
                 val_image_l1_errors.append(
-                    _compute_image_space_l1(model, noise_scheduler, vae, sample_fn, z_x, z_y, device, accelerator)
+                    _compute_image_space_l1(model, noise_scheduler, vae, sample_fn, z_x, z_y, device, accelerator, s2_wvs)
                 ) 
             for t_val in EVAL_TIMESTEPS:
                 _accumulate_timestep_records(model, noise_scheduler, l1_metric, z_x, z_y, t_val, device, accelerator, all_val_records)
@@ -145,7 +141,7 @@ def run_validation(model, val_loader, noise_scheduler, vae, sample_fn, device, a
         "records": all_val_records,   # needed downstream for best/worst plotting
     }
 
-def decode_records(records_list, model, noise_scheduler, vae, sample_fn, device, accelerator):
+def decode_records(records_list, model, noise_scheduler, vae, sample_fn, device, accelerator, s2_wvs, s1_wvs):
     unwrapped = accelerator.unwrap_model(model)
     unwrapped.eval()
     decoded = []
@@ -153,19 +149,20 @@ def decode_records(records_list, model, noise_scheduler, vae, sample_fn, device,
         z_sar = item['sar_lat'].unsqueeze(0).to(device)
         z_gt = item['gt_lat'].unsqueeze(0).to("cpu")
         z_gen = sample_fn(unwrapped, noise_scheduler, z_sar, device, num_inference_steps=250)
+
         decoded.append({
             'loss': item['loss'],
-            'sar': vae.decode(z_sar.cpu() / 0.18215).sample.squeeze(0),
-            'pred': vae.decode(z_gen.cpu() / 0.18215).sample.squeeze(0),
-            'gt': vae.decode(z_gt / 0.18215).sample.squeeze(0),
+            'sar':  vae.decode_spatial_normalized(z_sar, s1_wvs).squeeze().cpu(),
+            'pred': vae.decode_spatial_normalized(z_gen, s2_wvs).squeeze().cpu(),
+            'gt': vae.decode_spatial_normalized(z_gt, s2_wvs).squeeze(0).cpu(),
         })
     return decoded
 
 
-def plot_best_worst(val_result, epoch, model, noise_scheduler, vae, sample_fn, device, accelerator, log_dir):
+def plot_best_worst(val_result, epoch, model, noise_scheduler, vae, sample_fn, device, accelerator, log_dir, s2_wvs, s1_wvs):
     plot_records = sorted(val_result["records"][500], key=lambda r: r['loss'])
-    best_5 = decode_records(plot_records[:5], model, noise_scheduler, vae, sample_fn, device, accelerator)
-    worst_5 = decode_records(plot_records[-5:], model, noise_scheduler, vae, sample_fn, device, accelerator)
+    best_5 = decode_records(plot_records[:5], model, noise_scheduler, vae, sample_fn, device, accelerator, s2_wvs, s1_wvs)
+    worst_5 = decode_records(plot_records[-5:], model, noise_scheduler, vae, sample_fn, device, accelerator, s2_wvs, s1_wvs)
     plot_performance(best_5, log_dir, tier_name=f"best_epoch_{epoch}")
     plot_performance(worst_5, log_dir, tier_name=f"worst_epoch_{epoch}")
 
@@ -184,11 +181,9 @@ def sample(model, scheduler, z_sar, device, num_inference_steps = 250, guidance_
     for t in sched.timesteps:
         t_batch = torch.full((z_sar.shape[0],), t, device=device, dtype=torch.long)
 
-        # concatenated_latent = torch.cat([z_sar, z_t], dim = 1)
         pred_cond, _ = model(z_sar, z_t, t_batch)
         pred_uncond, _ = model(z_sar_uncond, z_t, t_batch)
 
-        # pred_noise, _ = model(concatenated_latent, timesteps = t_batch)
         pred_noise = pred_uncond + (guidance_scale * (pred_cond - pred_uncond))
         z_t = sched.step(pred_noise, t, z_t).prev_sample
     return z_t 
@@ -239,10 +234,19 @@ def main(cfg_path, resume):
     model = CDiffSETUNet(latent_ch = cfg["model"]["latent_channels"], base_ch = cfg["model"]["base_channels"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]), weight_decay = 1e-2)
 
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to("cpu")
+    # vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to("cpu")
+    vae = EOFluxVAE.from_pretrained(
+        repo_id="nilsleh/eo-vae",
+        ckpt_filename="eo-vae.ckpt",
+        config_filename="model_config.yaml",
+        device=device,
+    )
     vae.eval()
     for param in vae.parameters():
         param.requires_grad = False
+
+    s1_wvs = torch.tensor([5.4, 5.6], dtype=torch.float32, device=device)           # 2 channels (VV, VH)
+    s2_wvs = torch.tensor([0.665, 0.56, 0.49], dtype=torch.float32, device=device)  # 3 channels (R, G, B)
         
     model, optimizer, train_loader, val_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader
@@ -280,10 +284,10 @@ def main(cfg_path, resume):
         val_result = None
         if epoch % 5 == 0 or epoch == total_epochs:
             eval_model = ema_model if accelerator.is_main_process else model
-            val_result = run_validation(eval_model, val_loader, noise_scheduler, vae, sample, device, accelerator)
+            val_result = run_validation(eval_model, val_loader, noise_scheduler, vae, sample, device, accelerator, s2_wvs, s1_wvs)
             
             if accelerator.is_main_process:       
-                plot_best_worst(val_result, epoch, eval_model, noise_scheduler, vae, sample, device, accelerator, log_dir)
+                plot_best_worst(val_result, epoch, eval_model, noise_scheduler, vae, sample, device, accelerator, log_dir, s2_wvs, s1_wvs)
 
         if accelerator.is_main_process:    
             elapsed = time.perf_counter() - epoch_start
