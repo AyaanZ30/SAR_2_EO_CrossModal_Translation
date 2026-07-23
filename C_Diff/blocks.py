@@ -90,12 +90,10 @@ class DilatedBottleneck(nn.Module):
         self.compress = nn.Conv2d(ch, mid_ch, kernel_size=1)
 
         # Divide mid_ch evenly among branches (48 channels each)
-        branch_ch = mid_ch // 4
+        branch_ch = mid_ch // 2
 
         self.branch1 = nn.Conv2d(branch_ch, branch_ch, kernel_size=3, padding=1, dilation=1)
         self.branch2 = nn.Conv2d(branch_ch, branch_ch, kernel_size=3, padding=2, dilation=2)
-        self.branch3 = nn.Conv2d(branch_ch, branch_ch, kernel_size=3, padding=4, dilation=4)
-        self.branch4 = nn.Conv2d(branch_ch, branch_ch, kernel_size=3, padding=8, dilation=8)
 
         self.proj = nn.Sequential(
             nn.Conv2d(mid_ch, ch, kernel_size=1),
@@ -103,13 +101,14 @@ class DilatedBottleneck(nn.Module):
             nn.SiLU()
         )
 
+        nn.init.zeros_(self.proj[0].weight)
+        nn.init.zeros_(self.proj[0].bias)
+
     def forward(self, x):
         feat = self.compress(x)
-        chunks = torch.chunk(feat, 4, dim = 1)
+        chunks = torch.chunk(feat, 2, dim = 1)
         out = torch.cat([
             self.branch1(chunks[0]), 
             self.branch2(chunks[1]), 
-            self.branch3(chunks[2]), 
-            self.branch4(chunks[3])
         ],dim=1)
         return x + self.proj(out)
