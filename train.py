@@ -50,7 +50,7 @@ def update_ema(ema_model, model, decay = 0.999):
         for k, v in ema_model.state_dict().items():
             v.copy_(v * decay + msd[k].detach().to(v.device) * (1 - decay)) 
 
-def diffusion_step(model, noise_scheduler, z_x, z_y, timesteps = None, cond_drop_prob = 0.15):
+def diffusion_step(model, noise_scheduler, z_x, z_y, timesteps = None, cond_drop_prob = 0.25):
     """Runs one forward pass of noise prediction + confidence, returns loss and raw components."""
     if timesteps is None: 
         timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (z_x.shape[0],), device = z_x.device).long()
@@ -206,6 +206,8 @@ def main(cfg_path, resume):
     
     ckpt_dir = cfg["train"]["checkpoint_dir"]
     log_dir = cfg["train"]["log_dir"]
+
+    per_epoch_ckpt_dir = os.path.join(ckpt_dir, cfg["train"]["per_epoch_dir"])
     
     if accelerator.is_main_process:
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -230,7 +232,7 @@ def main(cfg_path, resume):
     
     noise_scheduler = DDPMScheduler(num_train_timesteps = 1000)
     model = CDiffSETUNet(latent_ch = cfg["model"]["latent_channels"], base_ch = cfg["model"]["base_channels"])
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]), weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["train"]["lr"]), weight_decay = 1e-2)
 
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to("cpu")
     vae.eval()
@@ -271,7 +273,7 @@ def main(cfg_path, resume):
         train_stats = train_one_epoch(model, ema_model, train_loader, optimizer, noise_scheduler, accelerator)
             
         val_result = None
-        if epoch % 10 == 0 or epoch == total_epochs:
+        if epoch % 5 == 0 or epoch == total_epochs:
             eval_model = ema_model if accelerator.is_main_process else model
             val_result = run_validation(eval_model, val_loader, noise_scheduler, vae, sample, device, accelerator)
             
@@ -288,14 +290,17 @@ def main(cfg_path, resume):
                 "val_l1": dict(val_result["per_t"]) if val_result else None,
             })
             
-            # save_checkpoint(full_ckpt_path, epoch, model, optimizer, scaler, history)
-            torch.save({
+            epoch_ckpt_path = os.path.join(per_epoch_ckpt_dir, f"epoch_{epoch}.pt")
+            ckpt_data = {
                 "epoch": epoch,
                 "model_state": accelerator.unwrap_model(model).state_dict(),
                 "ema_model_state" : ema_model.state_dict() if ema_model is not None else None,
                 "optimizer_state": optimizer.state_dict(),
                 "history": history,
-            }, full_ckpt_path)
+            }
+
+            torch.save(ckpt_data, epoch_ckpt_path)           # checkpoint per epoch saved under a new file
+            torch.save(ckpt_data, full_ckpt_path)            # # Save/Overwrite the fixed path so --resume works automatically (global tracker)
         
         accelerator.wait_for_everyone()
 

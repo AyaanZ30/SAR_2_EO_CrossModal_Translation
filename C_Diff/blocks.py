@@ -24,6 +24,7 @@ class CDiffDownBlock(nn.Module):
                 nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
                 nn.GroupNorm(8, out_ch),
                 nn.SiLU(),
+                nn.Dropout2d(0.1),
                 nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
                 nn.GroupNorm(8, out_ch),
             ) for _ in range(num_residual_blocks)
@@ -62,6 +63,7 @@ class CDiffUpBlock(nn.Module):
                 nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
                 nn.GroupNorm(8, out_ch),
                 nn.SiLU(),
+                nn.Dropout2d(0.1),
                 nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
                 nn.GroupNorm(8, out_ch),
             ) for _ in range(num_residual_blocks)
