@@ -1,0 +1,92 @@
+
+experiment:
+  experiment_name: "eo-vae-dyn-conv"
+  exp_dir: "results/exps/eo-vae/new_dynamic_conv"
+
+wandb:
+  project: eo-vae
+  entity: nleh
+  mode: online
+
+model:
+  _target_: eo_vae.models.new_autoencoder.EOFluxVAE
+  
+  freeze_body: False
+
+  base_lr: 2e-4
+  final_lr: 2e-5
+  warmup_epochs: 1
+  decay_end_epoch: ${trainer.max_epochs}
+  clip_grad: 1.0
+
+  # Loss configuration
+  loss_fn:
+    _target_: eo_vae.models.modules.consistency_loss.EOConsistencyLoss
+    rec_loss_type: "char"
+    pixel_weight: 1.0
+    msssim_weight: 1.0
+      
+  encoder:
+    _target_: eo_vae.models.new_model.Encoder
+    z_channels: 32
+    resolution: 256
+    in_channels: 3
+    ch: 128
+    ch_mult: [ 1,2,4,4 ]  # num_down = len(ch_mult)-1
+    num_res_blocks: 2
+    use_dynamic_ops: True
+    dynamic_conv_kwargs:
+      wv_planes: 256
+      num_layers: 4
+
+  decoder:
+    _target_: eo_vae.models.new_model.Decoder
+    z_channels: 32
+    resolution: 256
+    out_ch: 3
+    ch: 128
+    ch_mult: [ 1,2,4,4 ]  # num_down = len(ch_mult)-1
+    num_res_blocks: 2
+    use_dynamic_ops: True
+    dynamic_conv_kwargs:
+      wv_planes: 256
+      decoder_head: 'stacked'
+      num_decoder_stages: 3      # 2 intermediate + 1 final
+      num_layers: 2              # Transformer layers per generator
+      num_heads: 8               # More attention heads
+      generator_type: 'factorized'
+      rank_ratio: 4
+
+
+datamodule:
+  _target_: eo_vae.datasets.terramesh_datamodule.TerraMeshDataModule
+  data_path: "/mnt/SSD2/nils/datasets/terramesh"
+  modalities: ["S2L2A"]  # Load modalities
+  batch_size: 16
+  eval_batch_size: 32
+  num_workers: 4
+  train_collate_mode: "random"  # Randomly select modality per batch
+  val_collate_mode: "S2L2A"     # Always use S2L2A for validation
+  normalize: true
+  norm_method: robust
+  target_size: [256, 256]
+
+trainer:
+  _target_: lightning.Trainer
+  max_epochs: 50
+  accelerator: gpu
+  precision: 16-mixed
+  #strategy: ddp
+  # strategy: ddp_find_unused_parameters_true
+  limit_val_batches: 100
+  limit_train_batches: 2000 # choose 1000 iterable dataset batches to have control over params
+  devices: [6]
+  #devices: [0,1,2,3]
+  # accumulate_grad_batches: 2
+  #gradient_clip_val: 1.0
+  log_every_n_steps: 100
+  # detect_anomaly: true
+  #overfit_batches: 10
+  
+
+flux_chkpt: /mnt/SSD2/nils/eo-vae/checkpoints/ae.safetensors

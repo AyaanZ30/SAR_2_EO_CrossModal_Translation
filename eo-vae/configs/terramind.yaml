@@ -1,0 +1,19 @@
+
+
+datamodule:
+  _target_: eo_vae.datasets.terramesh_datamodule.TerraMeshDataModule
+  data_path: "/mnt/SSD2/nils/datasets/terramesh"
+  modalities: ["S2L2A", "S2L1C", "S1RTC"]  # Load modalities
+  batch_size: 16
+  eval_batch_size: 32
+  num_workers: 4
+  train_collate_mode: "random"  # Randomly select modality per batch
+  val_collate_mode: "S2L2A"     # Always use S2L2A for validation
+  normalize: true
+  norm_method: zscore
+  target_size: [256, 256]
+
+
+model:
+  # Points to the function defined in your main script
+  _target_: __main__.build_terramind_model 

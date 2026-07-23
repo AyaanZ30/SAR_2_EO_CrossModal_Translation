@@ -1,0 +1,96 @@
+
+experiment:
+  experiment_name: "eo-vae-refine-s2-"
+  exp_dir: "results/exps/eo-vae/refine-s2"
+
+wandb:
+  project: eo-vae-refine
+  entity: nleh
+  mode: online
+
+model:
+  _target_: eo_vae.models.refiner.RefinerTrainer
+
+  lr: 2e-4
+  final_lr: 2e-5
+  # warmup_steps: ${trainer.limit_train_batches}
+  warmup_steps: 2000
+  num_training_steps: "${eval:'${trainer.limit_train_batches} * ${trainer.max_epochs}'}"
+
+  base_vae:
+    _target_: eo_vae.models.autoencoder_flux.FluxAutoencoderKL
+    encoder:
+      _target_: eo_vae.models.Encoder
+      z_channels: 32
+      resolution: 256
+      in_channels: 3
+      ch: 128
+      ch_mult: [ 1,2,4,4 ]  # num_down = len(ch_mult)-1
+      num_res_blocks: 2
+      use_dynamic_ops: True
+      dynamic_conv_kwargs:
+        num_layers: 4
+        wv_planes: 256
+
+    decoder:
+      _target_: eo_vae.models.Decoder
+      z_channels: 32
+      resolution: 256
+      out_ch: 3
+      ch: 128
+      ch_mult: [ 1,2,4,4 ]  # num_down = len(ch_mult)-1
+      num_res_blocks: 2
+      use_dynamic_ops: True
+      dynamic_conv_kwargs:
+        num_layers: 4
+        wv_planes: 256
+
+    loss_fn:
+      _target_: torch.nn.Identity
+
+  denoiser:
+    _target_: eo_vae.models.flow_refiner.EODenoiser
+    backbone:
+      _target_: eo_vae.models.modules.deco_refiner.DeCoPixelDecoder
+      channels: 12
+      hidden_dim: 128
+      num_blocks: 12
+    schedule:
+      _target_: azula.noise.DecaySchedule
+  sampler:
+    _target_: azula.sample.EulerSampler
+    _partial_: true
+  
+
+datamodule:
+  _target_: eo_vae.datasets.terramesh_datamodule.TerraMeshDataModule
+  data_path: "/mnt/SSD2/nils/datasets/terramesh"
+  modalities: ["S2L2A"]  # Load modalities
+  batch_size: 16
+  eval_batch_size: 32
+  num_workers: 2
+  train_collate_mode: "random"  # Randomly select modality per batch
+  val_collate_mode: "S2L2A"     # Always use S2L2A for validation
+  normalize: true
+  norm_method: zscore
+  target_size: [256, 256]
+
+trainer:
+  _target_: lightning.Trainer
+  max_epochs: 40
+  accelerator: gpu
+  precision: 16-mixed
+  #strategy: ddp
+  # strategy: ddp_find_unused_parameters_true
+  limit_val_batches: 10
+  limit_train_batches: 2000 # choose 1000 iterable dataset batches to have control over params
+  devices: [7]
+  #devices: [0,1,2,3]
+  # accumulate_grad_batches: 2
+  gradient_clip_val: 1.0
+  log_every_n_steps: 100
+  # detect_anomaly: true
+  #overfit_batches: 10
+  
+
+flux_chkpt: /mnt/SSD2/nils/eo-vae/checkpoints/ae.safetensors

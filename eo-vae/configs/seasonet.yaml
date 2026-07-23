@@ -1,0 +1,75 @@
+model:
+  _target_: eo_vae.models.autoencoder.AutoencoderKL
+  loss_fn:
+    _target_: eo_vae.models.modules.LPIPSWithDiscriminator
+    perceptual_loss:
+      _target_: eo_vae.models.modules.LPIPS
+      net:
+        _target_: eo_vae.models.dofa.dofa_base_patch16_224
+        pretrained: True
+    discriminator:
+      _target_: eo_vae.models.modules.loss_utils.NLayerDiscriminator
+    # set other loss params
+    disc_start: 20
+    kl_weight: 0.000001
+    disc_weight: 0.5
+
+  embed_dim: 4
+  
+  encoder:
+    _target_: eo_vae.models.Encoder
+    double_z: True
+    z_channels: 4
+    resolution: 256
+    in_channels: 3
+    out_ch: 3
+    ch: 128
+    ch_mult: [ 1,2,4,4 ]  # num_down = len(ch_mult)-1
+    num_res_blocks: 2
+    attn_resolutions: [ ]
+    dropout: 0.0
+
+  decoder:
+    _target_: eo_vae.models.Decoder
+    double_z: True
+    z_channels: 4
+    resolution: 256
+    in_channels: 3
+    out_ch: 3
+    ch: 128
+    ch_mult: [ 1,2,4,4 ]  # num_down = len(ch_mult)-1
+    num_res_blocks: 2
+    attn_resolutions: [ ]
+    dropout: 0.0
+
+  learning_rate: 0.0001
+
+datamodule:
+  _target_: datamodule.SeasoNetDataModule
+  root: "/mnt/rg_climate_benchmark/data/datasets_segmentation/SeasoNet"
+  bands: ['10m_RGB']
+  batch_size: 8
+  num_workers: 4
+  seasons: ["Spring", "Summer", "Fall", "Winter"]
+  size: 224
+
+experiment:
+  experiment_name: "eo-vae-seasonet"
+  exp_dir: "/mnt/results/nils/exps/eo-vae/seasonet"
+wandb:
+  project: eo-vae
+  entity: nleh
+  mode: online
+
+
+trainer:
+  _target_: lightning.Trainer
+  max_epochs: 100
+  accelerator: gpu
+  # strategy: ddp
+  # devices: [0, 1, 2, 3]
+  devices: [0]
+  # accumulate_grad_batches: 2
+  # gradient_clip_val: 1.0
+  log_every_n_steps: 20
+  overfit_batches: 10

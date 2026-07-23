@@ -1,0 +1,96 @@
+
+experiment:
+  experiment_name: "eo-vae-rob-freq"
+  exp_dir: "results/exps/eo-vae/robust"
+
+wandb:
+  project: eo-vae
+  entity: nleh
+  mode: online
+
+model:
+  _target_: eo_vae.models.autoencoder_flux.FluxAutoencoderKL
+  
+  freeze_body: False
+
+  base_lr: 2e-4
+  final_lr_sched: 2e-5
+  warmup_epochs: 1
+  decay_end_epoch: ${trainer.max_epochs}
+  clip_grad: 1.0
+
+  # eq vae
+  # p_prior: 0.5
+  # p_prior_s: 0.25
+  # anisotropic: False
+
+  # Loss configuration
+  loss_fn:
+    _target_: eo_vae.models.modules.consistency_loss.EOPatchLoss
+    disc_start: 4000
+    disc_weight: 0.5
+    ssim_weight: 0.2
+    discriminator:
+      _target_: eo_vae.models.modules.consistency_loss.DynamicPatchGAN
+      
+  
+  
+  encoder:
+    _target_: eo_vae.models.Encoder
+    z_channels: 32
+    resolution: 256
+    in_channels: 3
+    ch: 128
+    ch_mult: [ 1,2,4,4 ]  # num_down = len(ch_mult)-1
+    num_res_blocks: 2
+    use_dynamic_ops: True
+    dynamic_conv_kwargs:
+      num_layers: 4
+      wv_planes: 256
+
+  decoder:
+    _target_: eo_vae.models.Decoder
+    z_channels: 32
+    resolution: 256
+    out_ch: 3
+    ch: 128
+    ch_mult: [ 1,2,4,4 ]  # num_down = len(ch_mult)-1
+    num_res_blocks: 2
+    use_dynamic_ops: True
+    dynamic_conv_kwargs:
+      num_layers: 4
+      wv_planes: 256
+
+
+datamodule:
+  _target_: eo_vae.datasets.terramesh_datamodule.TerraMeshDataModule
+  data_path: "/mnt/SSD2/nils/datasets/terramesh"
+  modalities: ["S2L2A", "S2L1C", "S1RTC"]  # Load modalities
+  batch_size: 16
+  eval_batch_size: 32
+  num_workers: 4
+  train_collate_mode: "random"  # Randomly select modality per batch
+  val_collate_mode: "S2L2A"     # Always use S2L2A for validation
+  normalize: true
+  norm_method: robust
+  target_size: [256, 256]
+
+trainer:
+  _target_: lightning.Trainer
+  max_epochs: 50
+  accelerator: gpu
+  precision: 16-mixed
+  #strategy: ddp
+  # strategy: ddp_find_unused_parameters_true
+  limit_val_batches: 100
+  limit_train_batches: 2000 # choose 1000 iterable dataset batches to have control over params
+  devices: [5]
+  #devices: [0,1,2,3]
+  # accumulate_grad_batches: 2
+  #gradient_clip_val: 1.0
+  log_every_n_steps: 100
+  # detect_anomaly: true
+  #overfit_batches: 10
+  
+
+flux_chkpt: /mnt/SSD2/nils/eo-vae/checkpoints/ae.safetensors

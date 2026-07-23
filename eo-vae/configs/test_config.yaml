@@ -1,0 +1,44 @@
+model:
+  _target_: eo_vae.models.autoencoder.AutoencoderKL
+  loss_fn:
+    _target_: eo_vae.models.modules.LPIPSWithDiscriminator
+    perceptual_loss:
+      _target_: eo_vae.models.modules.LPIPS
+      net:
+        _target_: eo_vae.models.dofa.dofa_base_patch16_224
+        pretrained: True
+    discriminator:
+      _target_: eo_vae.models.modules.loss_utils.NLayerDiscriminator
+    # set other loss params
+    disc_start: 5
+    kl_weight: 0.000001
+    disc_weight: 0.5
+
+  embed_dim: 4
+  
+  encoder:
+    _target_: eo_vae.models.Encoder
+    double_z: True
+    z_channels: 4
+    resolution: 256
+    in_channels: 3
+    out_ch: 3
+    ch: 128
+    ch_mult: [ 1,2,4,4 ]  # num_down = len(ch_mult)-1
+    num_res_blocks: 2
+    attn_resolutions: [ ]
+    dropout: 0.0
+
+  decoder:
+    _target_: eo_vae.models.Decoder
+    double_z: True
+    z_channels: 4
+    resolution: 256
+    in_channels: 3
+    out_ch: 3
+    ch: 128
+    ch_mult: [ 1,2,4,4 ]  # num_down = len(ch_mult)-1
+    num_res_blocks: 2
+    attn_resolutions: [ ]
+    dropout: 0.0
+
