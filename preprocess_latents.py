@@ -8,7 +8,7 @@ from tqdm import tqdm
 from diffusers import AutoencoderKL
 from accelerate import Accelerator
 
-from src.dataset import SAR2EODataset, list_roi_ids, split_roi_ids
+from C_Diff.image_datasets import SAR2EODataset, list_roi_ids, split_roi_ids
 
 def main(cfg_path):
     with open(cfg_path) as f:

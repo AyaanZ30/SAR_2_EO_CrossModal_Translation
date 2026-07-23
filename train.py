@@ -208,12 +208,13 @@ def main(cfg_path, resume):
     log_dir = cfg["train"]["log_dir"]
 
     per_epoch_ckpt_dir = os.path.join(ckpt_dir, cfg["train"]["per_epoch_dir"])
-    
+    full_ckpt_path = os.path.join(ckpt_dir, "cdiffset_state.pt")
+
     if accelerator.is_main_process:
         os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(per_epoch_ckpt_dir, exist_ok = True)
         os.makedirs(log_dir, exist_ok=True)
         
-    full_ckpt_path = os.path.join(ckpt_dir, "cdiffset_state.pt")
     
     roi_ids = list_roi_ids(cfg["data"]["seasons_dir"])
     train_ids, val_ids = split_roi_ids(roi_ids, val_frac = cfg["data"]["val_frac"], seed = cfg["seed"])
