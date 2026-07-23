@@ -89,7 +89,7 @@ class DilatedBottleneck(nn.Module):
         self.branch2 = nn.Conv2d(ch, ch // 4, kernel_size=3, padding=2, dilation=2)
         self.branch3 = nn.Conv2d(ch, ch // 4, kernel_size=3, padding=4, dilation=4)
         self.branch4 = nn.Conv2d(ch, ch // 4, kernel_size=3, padding=8, dilation=8)
-        self.project = nn.Sequential(
+        self.proj = nn.Sequential(
             nn.Conv2d(ch, ch, kernel_size=1),
             nn.GroupNorm(8, ch),
             nn.SiLU()
