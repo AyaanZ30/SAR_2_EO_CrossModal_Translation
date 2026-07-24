@@ -146,11 +146,13 @@ def decode_records(records_list, model, noise_scheduler, vae, sample_fn, device,
     unwrapped.eval()
     decoded = []
 
-    # vae_dtype = vae.dtype if hasattr(vae, "dtype") else torch.float32
+    vae_dtype = next(vae.parameters()).dtype if list(vae.parameters()) else torch.float32
+
     for item in records_list:
-        z_sar = item['sar_lat'].unsqueeze(0).to(device)
-        z_gt = item['gt_lat'].unsqueeze(0).to("cpu")
-        z_gen = sample_fn(unwrapped, noise_scheduler, z_sar, device, num_inference_steps=250)
+        z_sar = item['sar_lat'].unsqueeze(0).to(device, dtype = vae_dtype)
+        # z_gt = item['gt_lat'].unsqueeze(0).to("cpu")
+        z_gt = item['gt_lat'].unsqueeze(0).to(device, dtype = vae_dtype)
+        z_gen = sample_fn(unwrapped, noise_scheduler, z_sar, device, num_inference_steps=250).to(dtype=vae_dtype)
 
         decoded.append({
             'loss': item['loss'],
