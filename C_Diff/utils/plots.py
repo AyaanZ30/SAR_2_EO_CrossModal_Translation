@@ -17,8 +17,8 @@ def plot_performance(extreme_samples, output_dir, tier_name = "best"):
     for idx, sample in enumerate(extreme_samples):
         # Denormalize images from [-1, 1] to [0, 1] for visual display
         sar = ((sample['sar'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
-        if sar.shape[-1] == 3:
-            sar = sar[:, :, 0]
+        if sar.shape[-1] == 2 or sar.shape[-1] == 3:
+            sar = sar[:, :, 0]                          # Extract the primary polarization channel (VV)
             
         pred = ((sample['pred'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
         gt = ((sample['gt'] + 1.0) / 2.0).permute(1, 2, 0).cpu().numpy()
