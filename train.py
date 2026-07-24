@@ -87,13 +87,13 @@ def _compute_image_space_l1(model, noise_scheduler, vae, sample_fn, z_x, z_y, de
     unwrapped = accelerator.unwrap_model(model)
     z_gen = sample_fn(unwrapped, noise_scheduler, z_x, device, num_inference_steps = 250)
 
-    # img_pred = vae.decode((z_gen.cpu()) / 0.18215).sample
-    # img_gt = vae.decode((z_y.cpu()) / 0.18215).sample
-    img_pred = vae.decode_spatial_normalized(z_gen.cpu(), s2_wvs)
-    img_gt = vae.decode_spatial_normalized(z_y.cpu(), s2_wvs)
+    z_gen_dev = z_gen.to(device=device, dtype=vae.dtype if hasattr(vae, "dtype") else torch.float32)
+    z_y_dev = z_y.to(device=device, dtype=vae.dtype if hasattr(vae, "dtype") else torch.float32)
 
-    img_l1 = torch.abs(img_pred - img_gt).mean(dim = [1, 2, 3])
-    img_l1 = img_l1.to(device)
+    img_pred = vae.decode_spatial_normalized(z_gen_dev, s2_wvs)
+    img_gt = vae.decode_spatial_normalized(z_y_dev, s2_wvs)
+
+    img_l1 = torch.abs(img_pred - img_gt).mean(dim=[1, 2, 3])
 
     gathered = accelerator.gather_for_metrics(img_l1)
     return gathered.mean().item()
@@ -145,6 +145,8 @@ def decode_records(records_list, model, noise_scheduler, vae, sample_fn, device,
     unwrapped = accelerator.unwrap_model(model)
     unwrapped.eval()
     decoded = []
+
+    # vae_dtype = vae.dtype if hasattr(vae, "dtype") else torch.float32
     for item in records_list:
         z_sar = item['sar_lat'].unsqueeze(0).to(device)
         z_gt = item['gt_lat'].unsqueeze(0).to("cpu")
@@ -309,7 +311,7 @@ def main(cfg_path, resume):
             }
 
             torch.save(ckpt_data, epoch_ckpt_path)           # checkpoint per epoch saved under a new file
-            torch.save(ckpt_data, full_ckpt_path)            # # Save/Overwrite the fixed path so --resume works automatically (global tracker)
+            torch.save(ckpt_data, full_ckpt_path)            #  Save/Overwrite the fixed path so --resume works automatically (global tracker)
         
         accelerator.wait_for_everyone()
 
